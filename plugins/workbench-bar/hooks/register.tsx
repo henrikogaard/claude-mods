@@ -100,6 +100,66 @@ async function refreshThreads($: EngineInterface) {
   }))
 }
 
+// Claude CLI threads running in a terminal in this same repository
+type CliThread = { pid: string; tty: string; cwd: string; title: string; isWorking: boolean; at: number }
+let cliThreads: CliThread[] = []
+
+async function refreshCli($: EngineInterface) {
+  // A CLI thread is a `claude` process with a terminal; the desktop app's own threads have none (??)
+  const ps = await $.process.run(['ps', '-axo', 'pid=,tty=,command='], { timeoutMs: 5_000 })
+  if (ps.exitCode !== 0) return
+  const procs = ps.stdout
+    .split('\n')
+    .map(l => /^\s*(\d+)\s+(\S+)\s+(\S+)/.exec(l))
+    .filter((m): m is RegExpExecArray => Boolean(m && m[2] !== '??' && /(^|\/)claude$|\/claude\/versions\/[^/]+$/.test(m[3] ?? '')))
+    .map(m => ({ pid: m[1] as string, tty: m[2] as string }))
+  if (procs.length === 0) {
+    cliThreads = []
+    return
+  }
+  // Each process's working folder, from lsof: p<pid> then n<path>
+  const ls = await $.process.run(['lsof', '-a', '-d', 'cwd', '-Fpn', '-p', procs.map(x => x.pid).join(',')], { timeoutMs: 5_000 })
+  const cwds: Record<string, string> = {}
+  let pid = ''
+  for (const line of ls.stdout.split('\n')) {
+    if (line.startsWith('p')) pid = line.slice(1)
+    else if (line.startsWith('n') && pid) cwds[pid] = line.slice(1)
+  }
+  const repo = projectOf(await $.session.root())
+  const t = await $.clock.now()
+  const home = (await $.env.get('HOME')) ?? ''
+  const found: CliThread[] = []
+  for (const x of procs) {
+    const cwd = cwds[x.pid]
+    if (!cwd || projectOf(cwd) !== repo) continue
+    // Its transcript: the newest .jsonl in ~/.claude/projects/<cwd with / and . as ->
+    const dir = home + '/.claude/projects/' + cwd.replace(/[/.]/g, '-')
+    let title = 'Terminal thread'
+    let at = 0
+    try {
+      const files = (await $.fs.list(dir)).filter(f => f.kind === 'file' && f.name.endsWith('.jsonl'))
+      let newest = ''
+      for (const f of files) {
+        const st = await $.fs.stat(dir + '/' + f.name)
+        const m = Number((st as { mtimeMs?: number }).mtimeMs ?? 0)
+        if (m > at) {
+          at = m
+          newest = dir + '/' + f.name
+        }
+      }
+      if (newest) {
+        const first = await $.process.run(['grep', '-m1', '"type":"user"', newest], { timeoutMs: 5_000 })
+        const msg = JSON.parse(first.stdout || '{}') as { message?: { content?: string | { type: string; text?: string }[] } }
+        const c = msg.message?.content
+        const text = typeof c === 'string' ? c : (c?.find(b => b.type === 'text')?.text ?? '')
+        if (text.trim()) title = text.trim().split('\n')[0]!.slice(0, 80)
+      }
+    } catch {}
+    found.push({ pid: x.pid, tty: x.tty, cwd, title, isWorking: at > 0 && t - at < 20_000, at })
+  }
+  cliThreads = found
+}
+
 // PRs where someone asked you for a review
 let reviewRequests: { id: string; title: string; url: string; author: string }[] = []
 // The Linear issue this thread works on, from the branch name (claude/abc-26-calendar → ABC-26)
@@ -496,7 +556,7 @@ async function refreshLinked($: EngineInterface) {
 }
 
 async function refreshAll($: EngineInterface) {
-  await Promise.allSettled([refreshAgents($), refreshGithub($), refreshGit($), refreshThreads($)])
+  await Promise.allSettled([refreshAgents($), refreshGithub($), refreshGit($), refreshThreads($), refreshCli($)])
   await refreshPr($).catch(() => {})
   await refreshLinear($).catch(() => {})
   await refreshLinked($).catch(() => {})
@@ -842,7 +902,7 @@ export const register: Register = (on, options) => {
       }
       // The Agents panel is open: keep its clocks and statuses moving
       const isPanelTick = isDeckOpen && section === 'agents' && tick % 3 === 0
-      if (isPanelTick) await Promise.allSettled([refreshAgents($), refreshStats($)])
+      if (isPanelTick) await Promise.allSettled([refreshAgents($), refreshStats($), refreshCli($)])
       if (surface !== 'desktop' || isNewMinute || isTimeToSwitch || isPanelTick) $.ui.invalidate('ui.render')
     })
     return next(e)
@@ -1092,7 +1152,7 @@ export const register: Register = (on, options) => {
           const total = live.reduce((n, a) => n + (agentUse[a.id]?.stepTotal ?? 0), 0)
           return (
             <Box key="agents-wrap" flexDirection="row" columnGap={1}>
-              {item('agents', 'agents', '◉', CYAN, String(running) + (total ? ' · ' + done + '/' + total : ''), running === 0)}
+              {item('agents', 'agents', '◉', CYAN, String(running) + (cliThreads.length ? ' +' + cliThreads.length + ' ⌨' : '') + (total ? ' · ' + done + '/' + total : ''), running === 0 && cliThreads.length === 0)}
               {total ? (els as any).Svg({ key: 'agents-progress', source: barSvg(done / total, CYAN, true, 48), alt: 'subagent progress ' + done + ' of ' + total, width: 48, height: 4, isInteractive: true }) : null}
             </Box>
           )
@@ -1229,6 +1289,27 @@ export const register: Register = (on, options) => {
         <Text key="gap1"> </Text>,
         <Text key="h-run" bold>{'▾ Running · ' + live.length}</Text>,
         ...(live.length ? live.map(card) : [empty('No subagents running.')]),
+        ...(cliThreads.length
+          ? [
+              <Text key="gap-cli"> </Text>,
+              group('agents', '⌨ Terminal threads', cliThreads.length),
+              ...(isOpen('agents', '⌨ Terminal threads')
+                ? cliThreads.map(c => (
+                    <Box key={'cli-' + c.pid} flexDirection="row" columnGap={1} marginBottom={1}>
+                      {svg('cli-av-' + c.pid, avatarSvg('terminal', c.isWorking), 'terminal thread', 22, 20, c.isWorking)}
+                      <Box flexDirection="column" flexGrow={1}>
+                        <Box flexDirection="row">
+                          <Text bold wrap="truncate-end">{c.title}</Text>
+                          <Box flexGrow={1} />
+                          <Text color={c.isWorking ? GREEN : dim}>{c.isWorking ? '●' : '○'}</Text>
+                        </Box>
+                        <Text color={dim} wrap="truncate-end">{'cli · ' + c.tty + ' · ' + (c.cwd.split('/').pop() ?? '') + (c.at ? ' · ' + ago(new Date(c.at).toISOString()) : '')}</Text>
+                      </Box>
+                    </Box>
+                  ))
+                : []),
+            ]
+          : []),
         ...(done.length ? [<Text key="gap2"> </Text>, <Text key="h-done" bold>{'▾ Finished · ' + done.length}</Text>, ...done.slice(-10).reverse().map(card)] : []),
       ]
     } else if (section === 'github') {
