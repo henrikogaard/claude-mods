@@ -1,0 +1,8 @@
+{
+  "name": "claude-mods",
+  "owner": { "name": "Henrik Øgård" },
+  "plugins": [
+    { "name": "workbench-bar", "source": "./plugins/workbench-bar", "description": "A workbench bar above the prompt: usage meters, PR and CI, GitHub and Linear, subagent progress, other threads, a sidebar toggle and Clawd" },
+    { "name": "guards", "source": "./plugins/guards", "description": "Blocks AI attribution in commits and PRs, secrets in commands and files, and edits on main or master" }
+  ]
+}

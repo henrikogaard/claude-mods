@@ -1,0 +1,29 @@
+{
+  "name": "guards",
+  "version": "0.1.0",
+  "description": "Blocks AI attribution in commits and PRs, secrets in commands and files, and edits on main or master",
+  "userConfig": {
+    "attribution": {
+      "type": "boolean",
+      "title": "No-attribution guard",
+      "description": "Deny git commit and gh pr create/edit whose text credits an AI",
+      "default": true
+    },
+    "secrets": {
+      "type": "boolean",
+      "title": "Secret guard",
+      "description": "Deny commands and file writes that contain a likely secret value",
+      "default": true
+    },
+    "branch": {
+      "type": "boolean",
+      "title": "Branch guard",
+      "description": "Deny file edits in a git repository checked out on main or master",
+      "default": true
+    }
+  },
+  "author": {
+    "name": "Henrik Øgård"
+  },
+  "license": "MIT"
+}

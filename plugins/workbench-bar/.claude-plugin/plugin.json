@@ -1,0 +1,23 @@
+{
+  "name": "workbench-bar",
+  "version": "0.1.0",
+  "description": "A workbench bar above the Claude Code prompt: usage meters, PR and CI, GitHub and Linear, subagent progress, other threads, a sidebar toggle and Clawd",
+  "userConfig": {
+    "sound": {
+      "type": "boolean",
+      "title": "Sounds",
+      "description": "Play a short chime when a long turn or a CI run finishes",
+      "default": false
+    },
+    "linearServer": {
+      "type": "string",
+      "title": "Linear connector name",
+      "description": "Optional: the name /mcp lists your Linear connector under, when it isn't 'claude.ai Linear'",
+      "default": ""
+    }
+  },
+  "author": {
+    "name": "Henrik Øgård"
+  },
+  "license": "MIT"
+}
