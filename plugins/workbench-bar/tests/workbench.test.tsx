@@ -35,8 +35,10 @@ function fakes(on: any, start: string, opts: { linearTeam?: string; agents?: unk
     const argv = (Array.isArray(e) ? e : (e.argv ?? e.args ?? [])) as string[]
     opts.calls?.push(argv.join(' '))
     // Two claude processes: one in a terminal in this repo, one the desktop app's (no terminal)
-    // This thread is 900 (the parent of the ps it runs); it ran a shell (901) that started `claude -p` (902)
-    const mine = '  900 1 ??  /Apps/claude\n  950 900 ??  ps -axo pid=,ppid=,tty=,command=\n' + (opts.spawned?.live ? '  901 900 ??  /bin/zsh\n  902 901 ??  claude\n' : '')
+    // This thread is 900 (the parent of the ps it runs); a background shell (901) started `claude -p` (902)
+    const mine = '  900 1 ??  /Apps/claude\n  950 900 ??  ps -axo pid=,ppid=,tty=,command=\n' + (opts.spawned?.live ? '  901 1 ??  /bin/sh\n  902 901 ??  claude -p hi\n' : '')
+    // A background command is cut loose (its shell's parent is 1), but the env names the thread
+    if (argv[0] === 'ps' && argv[1] === 'eww') return { value: { exitCode: 0, stdout: '  902 claude -p hi HOME=/home/me CLAUDE_PID=900 CLAUDE_CODE_SESSION_ID=this-thread\n  101 claude --resume CLAUDE_PID=555\n', stderr: '' } }
     if (argv[0] === 'ps') return { value: { exitCode: 0, stdout: mine + (!opts.cli ? '' : '  101 1 ttys003  claude --resume\n  102 1 ??  /Apps/claude\n  103 1 ttys004  vim\n'), stderr: '' } }
     if (argv[0] === 'lsof') return { value: { exitCode: 0, stdout: 'p101\nfcwd\nn/home/me/code/demo/.claude/worktrees/w\np902\nfcwd\nn/tmp/billing\n', stderr: '' } }
     // One closed CLI thread in this repo's transcripts

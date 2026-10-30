@@ -183,8 +183,22 @@ async function refreshCli($: EngineInterface) {
     for (let p = parent[pid], n = 0; p && p !== '1' && n < 30; p = parent[p], n++) if (p === selfPid) return true
     return false
   }
+  // A background command is cut loose from its parent, but a claude it starts still carries the
+  // thread's CLAUDE_PID and CLAUDE_CODE_SESSION_ID. Only those two are read; the rest is dropped
+  const sessionId = await $.session.id().catch(() => '')
+  const others = rows.filter(r => r.isClaude && r.pid !== selfPid)
+  const startedBy: Record<string, boolean> = {}
+  if (others.length > 0) {
+    const env = await $.process.run(['ps', 'eww', '-o', 'pid=,command=', '-p', others.map(r => r.pid).join(',')], { timeoutMs: 5_000 })
+    for (const line of env.stdout.split('\n')) {
+      const pid = /^\s*(\d+)/.exec(line)?.[1]
+      const byPid = [...line.matchAll(/ CLAUDE_PID=(\d+)/g)].pop()?.[1]
+      const bySession = [...line.matchAll(/ CLAUDE_CODE_SESSION_ID=([\w-]+)/g)].pop()?.[1]
+      if (pid) startedBy[pid] = Boolean((selfPid && byPid === selfPid) || (sessionId && bySession === sessionId))
+    }
+  }
+  const mine = others.filter(r => startedBy[r.pid] || (selfPid && isMine(r.pid)))
   // A terminal thread has a terminal; the desktop app's own threads have none (??)
-  const mine = rows.filter(r => r.isClaude && selfPid && r.pid !== selfPid && isMine(r.pid))
   const terminal = rows.filter(r => r.isClaude && r.tty !== '??' && !mine.includes(r))
   const procs = [...mine, ...terminal]
   const cwds: Record<string, string> = {}
@@ -199,7 +213,6 @@ async function refreshCli($: EngineInterface) {
   }
   const open = new Set<string>()
   // This thread writes its own transcript all the time, so never take that one
-  const sessionId = await $.session.id().catch(() => '')
   const thread = async (x: { pid: string; tty: string }, cwd: string): Promise<CliThread> => {
     const tr = await newestTranscript($, home, cwd, sessionId + '.jsonl')
     let title = 'Terminal thread'
