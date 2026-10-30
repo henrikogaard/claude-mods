@@ -3,7 +3,7 @@ import { expect, mock, test } from 'claude-code/testing'
 const BAND = { component: 'AbovePrompt', props: { hasSurvey: false, isWorking: false, maxRows: 5, bodyColumns: 140 } as any } as const
 
 // Fakes for the desktop app's sidebar, Linear, gh and the session
-function fakes(on: any, start: string, opts: { linearTeam?: string; agents?: unknown[]; branch?: string; calls?: string[] } = {}) {
+function fakes(on: any, start: string, opts: { linearTeam?: string; agents?: unknown[]; branch?: string; calls?: string[]; cli?: boolean; closed?: boolean; spawned?: { live: boolean } } = {}) {
   const state = { groupBy: start, sortBy: 'created' }
   on('mcp.call', async ($: unknown, e: { server: string; tool: string; args: Record<string, unknown> }) => {
     const ok = (data: unknown) => ({ value: { isError: false, content: [{ type: 'text', text: JSON.stringify(data) }] } })
@@ -34,6 +34,18 @@ function fakes(on: any, start: string, opts: { linearTeam?: string; agents?: unk
   on('process.run', async ($: unknown, e: any) => {
     const argv = (Array.isArray(e) ? e : (e.argv ?? e.args ?? [])) as string[]
     opts.calls?.push(argv.join(' '))
+    // Two claude processes: one in a terminal in this repo, one the desktop app's (no terminal)
+    // This thread is 900 (the parent of the ps it runs); a background shell (901) started `claude -p` (902)
+    const mine = '  900 1 ??  /Apps/claude\n  950 900 ??  ps -axo pid=,ppid=,tty=,command=\n' + (opts.spawned?.live ? '  901 1 ??  /bin/sh\n  902 901 ??  claude -p hi\n' : '')
+    // A background command is cut loose (its shell's parent is 1), but the env names the thread
+    if (argv[0] === 'ps' && argv[1] === 'eww') return { value: { exitCode: 0, stdout: '  902 claude -p hi HOME=/home/me CLAUDE_PID=900 CLAUDE_CODE_SESSION_ID=this-thread\n  101 claude --resume CLAUDE_PID=555\n', stderr: '' } }
+    if (argv[0] === 'ps') return { value: { exitCode: 0, stdout: mine + (!opts.cli ? '' : '  101 1 ttys003  claude --resume\n  102 1 ??  /Apps/claude\n  103 1 ttys004  vim\n'), stderr: '' } }
+    if (argv[0] === 'lsof') return { value: { exitCode: 0, stdout: 'p101\nfcwd\nn/home/me/code/demo/.claude/worktrees/w\np902\nfcwd\nn/tmp/billing\n', stderr: '' } }
+    // One closed CLI thread in this repo's transcripts
+    if (argv[0] === 'grep' && argv[1] === '-l') return { value: { exitCode: 0, stdout: opts.closed ? argv.filter(a => a.endsWith('old-id.jsonl')).join('\n') : '', stderr: '' } }
+    if (argv[0] === 'grep' && String(argv[3]).endsWith('old-id.jsonl'))
+      return { value: { exitCode: 0, stdout: JSON.stringify({ type: 'user', cwd: '/home/me/code/demo', message: { content: 'Write the release notes' } }), stderr: '' } }
+    if (argv[0] === 'grep') return { value: { exitCode: 0, stdout: JSON.stringify({ type: 'user', message: { content: 'Refactor the parser\nplease' } }), stderr: '' } }
     const branch = opts.branch ?? 'feat/pixel-bar'
     if (argv[0] === 'git') return { value: { exitCode: 0, stdout: '## ' + branch + '...origin/' + branch + ' [ahead 2]\n M a.ts\n?? b.ts\n', stderr: '' } }
     if (argv.includes('view') && argv.includes('pr'))
@@ -56,6 +68,15 @@ function fakes(on: any, start: string, opts: { linearTeam?: string; agents?: unk
   })
   on('session.root', async () => ({ value: '/home/me/code/demo/.claude/worktrees/x' }))
   on('tool.list', async () => ({ value: [] }))
+  on('env.get', async () => ({ value: '/home/me' }))
+  on('session.id', async () => ({ value: 'this-thread' }))
+  on('fs.list', async ($: unknown, e: any) => {
+    const path = String(e.path ?? e)
+    if (opts.closed && path.endsWith('/.claude/projects')) return { value: [{ name: '-home-me-code-demo', kind: 'dir', size: 0, isLink: false }] }
+    if (opts.closed && path.endsWith('-home-me-code-demo')) return { value: [{ name: 'old-id.jsonl', kind: 'file', size: 10, isLink: false }] }
+    return { value: [{ name: 'abc.jsonl', kind: 'file', size: 10, isLink: false }] }
+  })
+  on('fs.stat', async () => ({ value: { mtimeMs: 1, size: 10, kind: 'file' } }))
   on('agent.list', async () => ({ value: opts.agents ?? [] }))
   on('session.usage', async () => ({ value: { startedAt: 0, context: { tokens: 0, window: 1, percent: 12 }, rateLimits: [], cost: { usd: 0.32 } } }))
   on('ui.open', async () => ({ value: { isPlaced: true } }))
@@ -368,5 +389,54 @@ test('the bar shows this thread\'s context, other threads working, and overall s
   await ui.unmount()
   const deck = await $.ui.mount({ plugin: 'workbench-bar', surface: 'desktop', ...PANE })
   expect(await deck.find({ type: 'Text', text: /Fix calendar/ })).toBeDefined()
+  await deck.unmount()
+})
+
+test('Claude CLI threads in the same repo show in the Agents panel and the chip', async ($, on) => {
+  await started($, on, { cli: true })
+  const bar = await $.ui.mount({ plugin: 'workbench-bar', surface: 'desktop', ...BAND })
+  expect(((await bar.find({ key: 'agents' })) as any)?.props?.label).toBe('0 +1 ⌨')
+  await bar.press({ key: 'agents' })
+  await bar.unmount()
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const deck = await $.ui.mount({ plugin: 'workbench-bar', surface, ...PANE })
+    expect(await deck.find({ type: 'Text', text: /Refactor the parser/ })).toBeDefined()
+    expect(await deck.find({ type: 'Text', text: /ttys003/ })).toBeDefined()
+    await deck.unmount()
+  }
+})
+
+test('closed CLI threads from the last 7 days show in the panel, but not in the chip', async ($, on) => {
+  await started($, on, { closed: true })
+  const bar = await $.ui.mount({ plugin: 'workbench-bar', surface: 'desktop', ...BAND })
+  expect(((await bar.find({ key: 'agents' })) as any)?.props?.label).toBe('0')
+  await bar.press({ key: 'agents' })
+  await bar.unmount()
+  const deck = await $.ui.mount({ plugin: 'workbench-bar', surface: 'desktop', ...PANE })
+  expect(await deck.find({ type: 'Text', text: /Write the release notes/ })).toBeDefined()
+  expect(await deck.find({ type: 'Text', text: /claude -r old-id/ })).toBeDefined()
+  await deck.unmount()
+})
+
+test('CLI threads this thread started show under Started here, and stay after they close', async ($, on) => {
+  const spawned = { live: true }
+  const saved: Record<string, unknown> = {}
+  on('store.get', async ($: unknown, e: any) => ({ value: saved[e.key ?? e] }))
+  on('store.set', async ($: unknown, e: any) => {
+    saved[e.key] = e.value
+    return { value: undefined }
+  })
+  const clock = await started($, on, { spawned })
+  const bar = await $.ui.mount({ plugin: 'workbench-bar', surface: 'desktop', ...BAND })
+  expect(((await bar.find({ key: 'agents' })) as any)?.props?.label).toBe('0 +1 ⌨')
+  await bar.press({ key: 'agents' })
+  await bar.unmount()
+  let deck = await $.ui.mount({ plugin: 'workbench-bar', surface: 'desktop', ...PANE })
+  expect(await deck.find({ type: 'Text', text: /pid 902 · billing/ })).toBeDefined()
+  await deck.unmount()
+  spawned.live = false
+  await clock.advance(10_000)
+  deck = await $.ui.mount({ plugin: 'workbench-bar', surface: 'desktop', ...PANE })
+  expect(await deck.find({ type: 'Text', text: /closed · billing.*claude -r abc/ })).toBeDefined()
   await deck.unmount()
 })

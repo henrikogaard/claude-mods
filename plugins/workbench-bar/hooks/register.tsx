@@ -100,6 +100,154 @@ async function refreshThreads($: EngineInterface) {
   }))
 }
 
+// Claude CLI threads in this same repository: open in a terminal, or closed in the last 7 days
+type CliThread = { id: string; pid: string; tty: string; cwd: string; title: string; isWorking: boolean; isClosed: boolean; at: number }
+let cliThreads: CliThread[] = []
+let cliClosed: CliThread[] = []
+let cliScannedAt = -Infinity
+const CLI_DAYS = 7
+
+// The first user message in a transcript, as a one-line title, and the folder it ran in
+async function transcriptHead($: EngineInterface, path: string) {
+  const first = await $.process.run(['grep', '-m1', '"type":"user"', path], { timeoutMs: 5_000 })
+  const msg = JSON.parse(first.stdout || '{}') as { cwd?: string; message?: { content?: string | { type: string; text?: string }[] } }
+  const c = msg.message?.content
+  const text = typeof c === 'string' ? c : (c?.find(b => b.type === 'text')?.text ?? '')
+  return { title: text.trim() ? text.trim().split('\n')[0]!.slice(0, 80) : '', cwd: msg.cwd ?? '' }
+}
+
+// Closed CLI threads: transcripts from the CLI (entrypoint "cli") in this repo's project folders
+async function scanClosedCli($: EngineInterface, repo: string, home: string, t: number, open: Set<string>) {
+  const root = home + '/.claude/projects'
+  const dirs = (await $.fs.list(root)).filter(d => d.kind === 'dir' && d.name.includes('-' + repo.replace(/[/.]/g, '-')))
+  const recent: { path: string; at: number }[] = []
+  for (const d of dirs) {
+    for (const f of await $.fs.list(root + '/' + d.name)) {
+      if (f.kind !== 'file' || !f.name.endsWith('.jsonl')) continue
+      const path = root + '/' + d.name + '/' + f.name
+      const at = Number(((await $.fs.stat(path)) as { mtimeMs?: number }).mtimeMs ?? 0)
+      if (t - at < CLI_DAYS * 86_400_000 && !open.has(path)) recent.push({ path, at })
+    }
+  }
+  if (recent.length === 0) return []
+  const cli = await $.process.run(['grep', '-l', '"entrypoint":"cli"', ...recent.map(r => r.path)], { timeoutMs: 10_000 })
+  const isCli = new Set(cli.stdout.split('\n').filter(Boolean))
+  const found: CliThread[] = []
+  for (const r of recent.filter(x => isCli.has(x.path)).sort((a, b) => b.at - a.at).slice(0, 10)) {
+    const head = await transcriptHead($, r.path)
+    if (head.cwd && projectOf(head.cwd) !== repo) continue
+    const id = r.path.split('/').pop()!.replace(/\.jsonl$/, '')
+    found.push({ id, pid: '', tty: '', cwd: head.cwd, title: head.title || 'Terminal thread', isWorking: false, isClosed: true, at: r.at })
+  }
+  return found
+}
+
+// CLI threads this thread started (say, `claude -p` for API billing), kept after they close
+let cliSpawned: CliThread[] = []
+let selfPid = ''
+
+// A transcript's path and age: the newest .jsonl in ~/.claude/projects/<cwd with / and . as ->
+async function newestTranscript($: EngineInterface, home: string, cwd: string, skip: string) {
+  const dir = home + '/.claude/projects/' + cwd.replace(/[/.]/g, '-')
+  let path = ''
+  let at = 0
+  try {
+    for (const f of await $.fs.list(dir)) {
+      if (f.kind !== 'file' || !f.name.endsWith('.jsonl') || f.name === skip) continue
+      const m = Number(((await $.fs.stat(dir + '/' + f.name)) as { mtimeMs?: number }).mtimeMs ?? 0)
+      if (m > at) {
+        at = m
+        path = dir + '/' + f.name
+      }
+    }
+  } catch {}
+  return { path, at }
+}
+
+async function refreshCli($: EngineInterface) {
+  const ps = await $.process.run(['ps', '-axo', 'pid=,ppid=,tty=,command='], { timeoutMs: 5_000 })
+  if (ps.exitCode !== 0) return
+  const repo = projectOf(await $.session.root())
+  const t = await $.clock.now()
+  const home = (await $.env.get('HOME')) ?? ''
+  const rows = ps.stdout
+    .split('\n')
+    .map(l => /^\s*(\d+)\s+(\d+)\s+(\S+)\s+(\S+)(.*)$/.exec(l))
+    .filter((m): m is RegExpExecArray => Boolean(m))
+    .map(m => ({ pid: m[1] as string, ppid: m[2] as string, tty: m[3] as string, isClaude: /(^|\/)claude$|\/claude\/versions\/[^/]+$/.test(m[4] ?? ''), isThisPs: /(^|\/)ps$/.test(m[4] ?? '') && (m[5] ?? '').includes('pid=,ppid=,tty=,command=') }))
+  // This thread's own process started the ps above, so it's that ps's parent
+  selfPid = rows.find(r => r.isThisPs)?.ppid ?? selfPid
+  const parent: Record<string, string> = {}
+  for (const r of rows) parent[r.pid] = r.ppid
+  const isMine = (pid: string) => {
+    for (let p = parent[pid], n = 0; p && p !== '1' && n < 30; p = parent[p], n++) if (p === selfPid) return true
+    return false
+  }
+  // A background command is cut loose from its parent, but a claude it starts still carries the
+  // thread's CLAUDE_PID and CLAUDE_CODE_SESSION_ID. Only those two are read; the rest is dropped
+  const sessionId = await $.session.id().catch(() => '')
+  const others = rows.filter(r => r.isClaude && r.pid !== selfPid)
+  const startedBy: Record<string, boolean> = {}
+  if (others.length > 0) {
+    const env = await $.process.run(['ps', 'eww', '-o', 'pid=,command=', '-p', others.map(r => r.pid).join(',')], { timeoutMs: 5_000 })
+    for (const line of env.stdout.split('\n')) {
+      const pid = /^\s*(\d+)/.exec(line)?.[1]
+      const byPid = [...line.matchAll(/ CLAUDE_PID=(\d+)/g)].pop()?.[1]
+      const bySession = [...line.matchAll(/ CLAUDE_CODE_SESSION_ID=([\w-]+)/g)].pop()?.[1]
+      if (pid) startedBy[pid] = Boolean((selfPid && byPid === selfPid) || (sessionId && bySession === sessionId))
+    }
+  }
+  const mine = others.filter(r => startedBy[r.pid] || (selfPid && isMine(r.pid)))
+  // A terminal thread has a terminal; the desktop app's own threads have none (??)
+  const terminal = rows.filter(r => r.isClaude && r.tty !== '??' && !mine.includes(r))
+  const procs = [...mine, ...terminal]
+  const cwds: Record<string, string> = {}
+  if (procs.length > 0) {
+    // Each process's working folder, from lsof: p<pid> then n<path>
+    const ls = await $.process.run(['lsof', '-a', '-d', 'cwd', '-Fpn', '-p', procs.map(x => x.pid).join(',')], { timeoutMs: 5_000 })
+    let pid = ''
+    for (const line of ls.stdout.split('\n')) {
+      if (line.startsWith('p')) pid = line.slice(1)
+      else if (line.startsWith('n') && pid) cwds[pid] = line.slice(1)
+    }
+  }
+  const open = new Set<string>()
+  // This thread writes its own transcript all the time, so never take that one
+  const thread = async (x: { pid: string; tty: string }, cwd: string): Promise<CliThread> => {
+    const tr = await newestTranscript($, home, cwd, sessionId + '.jsonl')
+    let title = 'Terminal thread'
+    if (tr.path) {
+      open.add(tr.path)
+      try {
+        title = (await transcriptHead($, tr.path)).title || title
+      } catch {}
+    }
+    const id = tr.path ? tr.path.split('/').pop()!.replace(/\.jsonl$/, '') : x.pid
+    return { id, pid: x.pid, tty: x.tty, cwd, title, isWorking: tr.at > 0 && t - tr.at < 20_000, isClosed: false, at: tr.at }
+  }
+  const found: CliThread[] = []
+  for (const x of terminal) {
+    const cwd = cwds[x.pid]
+    if (cwd && projectOf(cwd) === repo) found.push(await thread(x, cwd))
+  }
+  // Started here: wherever they run. Ones that ended stay listed as closed
+  const key = 'spawned:' + sessionId
+  const live: CliThread[] = []
+  for (const x of mine) live.push({ ...(await thread(x, cwds[x.pid] ?? '')), isWorking: true })
+  const saved = ((await $.store.get(key).catch(() => undefined)) as CliThread[] | undefined) ?? []
+  const gone = saved.filter(c => !live.some(l => l.pid === c.pid)).map(c => ({ ...c, isWorking: false, isClosed: true }))
+  cliSpawned = [...live, ...gone].slice(0, 20)
+  if (cliSpawned.length) await $.store.set(key, cliSpawned).catch(() => {})
+  // Closed threads change slowly, so look again at most once a minute
+  if (t - cliScannedAt > 60_000) {
+    cliScannedAt = t
+    try {
+      cliClosed = await scanClosedCli($, repo, home, t, open)
+    } catch {}
+  }
+  cliThreads = found
+}
+
 // PRs where someone asked you for a review
 let reviewRequests: { id: string; title: string; url: string; author: string }[] = []
 // The Linear issue this thread works on, from the branch name (claude/abc-26-calendar → ABC-26)
@@ -496,7 +644,7 @@ async function refreshLinked($: EngineInterface) {
 }
 
 async function refreshAll($: EngineInterface) {
-  await Promise.allSettled([refreshAgents($), refreshGithub($), refreshGit($), refreshThreads($)])
+  await Promise.allSettled([refreshAgents($), refreshGithub($), refreshGit($), refreshThreads($), refreshCli($)])
   await refreshPr($).catch(() => {})
   await refreshLinear($).catch(() => {})
   await refreshLinked($).catch(() => {})
@@ -842,7 +990,7 @@ export const register: Register = (on, options) => {
       }
       // The Agents panel is open: keep its clocks and statuses moving
       const isPanelTick = isDeckOpen && section === 'agents' && tick % 3 === 0
-      if (isPanelTick) await Promise.allSettled([refreshAgents($), refreshStats($)])
+      if (isPanelTick) await Promise.allSettled([refreshAgents($), refreshStats($), refreshCli($)])
       if (surface !== 'desktop' || isNewMinute || isTimeToSwitch || isPanelTick) $.ui.invalidate('ui.render')
     })
     return next(e)
@@ -1055,6 +1203,7 @@ export const register: Register = (on, options) => {
         </Box>
       )
     }
+    const cliOpen = cliThreads.length + cliSpawned.filter(c => !c.isClosed).length
     const row = (
       <Box key="workbench-row" flexDirection="row" columnGap={3}>
         {(els as any).Svg({ key: 'clawd', source: clawdSvg(now < partyUntil ? 'party' : activity), alt: 'Clawd ' + (now < partyUntil ? 'party' : activity), isInteractive: true, width: 36, height: 18 })}
@@ -1092,7 +1241,7 @@ export const register: Register = (on, options) => {
           const total = live.reduce((n, a) => n + (agentUse[a.id]?.stepTotal ?? 0), 0)
           return (
             <Box key="agents-wrap" flexDirection="row" columnGap={1}>
-              {item('agents', 'agents', '◉', CYAN, String(running) + (total ? ' · ' + done + '/' + total : ''), running === 0)}
+              {item('agents', 'agents', '◉', CYAN, String(running) + (cliOpen ? ' +' + cliOpen + ' ⌨' : '') + (total ? ' · ' + done + '/' + total : ''), running === 0 && cliOpen === 0)}
               {total ? (els as any).Svg({ key: 'agents-progress', source: barSvg(done / total, CYAN, true, 48), alt: 'subagent progress ' + done + ' of ' + total, width: 48, height: 4, isInteractive: true }) : null}
             </Box>
           )
@@ -1187,6 +1336,30 @@ export const register: Register = (on, options) => {
       const t = now || 0
       const live = allAgents.filter(a => LIVE.includes(a.status))
       const done = allAgents.filter(a => !LIVE.includes(a.status))
+      const cliGroup = (name: string, list: CliThread[]) =>
+        list.length
+          ? [
+              <Text key={'gap-' + name}> </Text>,
+              group('agents', name, list.length),
+              ...(isOpen('agents', name)
+                ? list.map(c => (
+                    <Box key={'cli-' + name + c.id} flexDirection="row" columnGap={1} marginBottom={1}>
+                      {svg('cli-av-' + c.id, avatarSvg('terminal', c.isWorking), 'terminal thread', 22, 20, c.isWorking)}
+                      <Box flexDirection="column" flexGrow={1}>
+                        <Box flexDirection="row">
+                          <Text bold wrap="truncate-end">{c.title}</Text>
+                          <Box flexGrow={1} />
+                          <Text color={c.isWorking ? GREEN : dim}>{c.isClosed ? '✕' : c.isWorking ? '●' : '○'}</Text>
+                        </Box>
+                        <Text color={dim} wrap="truncate-end">
+                          {(c.isClosed ? 'closed' : 'cli · ' + (c.tty === '??' ? 'pid ' + c.pid : c.tty)) + ' · ' + (c.cwd.split('/').pop() ?? '') + (c.at ? ' · ' + ago(new Date(c.at).toISOString()) : '') + (c.isClosed && c.id !== c.pid ? ' · claude -r ' + c.id : '')}
+                        </Text>
+                      </Box>
+                    </Box>
+                  ))
+                : []),
+            ]
+          : []
       const card = (a: AgentRow) => {
         const u = agentUse[a.id]
         const isLive = LIVE.includes(a.status)
@@ -1229,6 +1402,8 @@ export const register: Register = (on, options) => {
         <Text key="gap1"> </Text>,
         <Text key="h-run" bold>{'▾ Running · ' + live.length}</Text>,
         ...(live.length ? live.map(card) : [empty('No subagents running.')]),
+        ...cliGroup('⤷ Started here', cliSpawned),
+        ...cliGroup('⌨ Terminal threads', [...cliThreads, ...cliClosed]),
         ...(done.length ? [<Text key="gap2"> </Text>, <Text key="h-done" bold>{'▾ Finished · ' + done.length}</Text>, ...done.slice(-10).reverse().map(card)] : []),
       ]
     } else if (section === 'github') {
