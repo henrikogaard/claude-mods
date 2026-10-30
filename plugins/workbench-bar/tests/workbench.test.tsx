@@ -3,7 +3,7 @@ import { expect, mock, test } from 'claude-code/testing'
 const BAND = { component: 'AbovePrompt', props: { hasSurvey: false, isWorking: false, maxRows: 5, bodyColumns: 140 } as any } as const
 
 // Fakes for the desktop app's sidebar, Linear, gh and the session
-function fakes(on: any, start: string, opts: { linearTeam?: string; agents?: unknown[]; branch?: string; calls?: string[]; cli?: boolean } = {}) {
+function fakes(on: any, start: string, opts: { linearTeam?: string; agents?: unknown[]; branch?: string; calls?: string[]; cli?: boolean; closed?: boolean } = {}) {
   const state = { groupBy: start, sortBy: 'created' }
   on('mcp.call', async ($: unknown, e: { server: string; tool: string; args: Record<string, unknown> }) => {
     const ok = (data: unknown) => ({ value: { isError: false, content: [{ type: 'text', text: JSON.stringify(data) }] } })
@@ -37,6 +37,10 @@ function fakes(on: any, start: string, opts: { linearTeam?: string; agents?: unk
     // Two claude processes: one in a terminal in this repo, one the desktop app's (no terminal)
     if (argv[0] === 'ps') return { value: { exitCode: 0, stdout: !opts.cli ? '' : '  101 ttys003  claude --resume\n  102 ??  /Apps/claude\n  103 ttys004  vim\n', stderr: '' } }
     if (argv[0] === 'lsof') return { value: { exitCode: 0, stdout: 'p101\nfcwd\nn/home/me/code/demo/.claude/worktrees/w\n', stderr: '' } }
+    // One closed CLI thread in this repo's transcripts
+    if (argv[0] === 'grep' && argv[1] === '-l') return { value: { exitCode: 0, stdout: opts.closed ? argv.filter(a => a.endsWith('old-id.jsonl')).join('\n') : '', stderr: '' } }
+    if (argv[0] === 'grep' && String(argv[3]).endsWith('old-id.jsonl'))
+      return { value: { exitCode: 0, stdout: JSON.stringify({ type: 'user', cwd: '/home/me/code/demo', message: { content: 'Write the release notes' } }), stderr: '' } }
     if (argv[0] === 'grep') return { value: { exitCode: 0, stdout: JSON.stringify({ type: 'user', message: { content: 'Refactor the parser\nplease' } }), stderr: '' } }
     const branch = opts.branch ?? 'feat/pixel-bar'
     if (argv[0] === 'git') return { value: { exitCode: 0, stdout: '## ' + branch + '...origin/' + branch + ' [ahead 2]\n M a.ts\n?? b.ts\n', stderr: '' } }
@@ -61,7 +65,12 @@ function fakes(on: any, start: string, opts: { linearTeam?: string; agents?: unk
   on('session.root', async () => ({ value: '/home/me/code/demo/.claude/worktrees/x' }))
   on('tool.list', async () => ({ value: [] }))
   on('env.get', async () => ({ value: '/home/me' }))
-  on('fs.list', async () => ({ value: [{ name: 'abc.jsonl', kind: 'file', size: 10, isLink: false }] }))
+  on('fs.list', async ($: unknown, e: any) => {
+    const path = String(e.path ?? e)
+    if (opts.closed && path.endsWith('/.claude/projects')) return { value: [{ name: '-home-me-code-demo', kind: 'dir', size: 0, isLink: false }] }
+    if (opts.closed && path.endsWith('-home-me-code-demo')) return { value: [{ name: 'old-id.jsonl', kind: 'file', size: 10, isLink: false }] }
+    return { value: [{ name: 'abc.jsonl', kind: 'file', size: 10, isLink: false }] }
+  })
   on('fs.stat', async () => ({ value: { mtimeMs: 1, size: 10, kind: 'file' } }))
   on('agent.list', async () => ({ value: opts.agents ?? [] }))
   on('session.usage', async () => ({ value: { startedAt: 0, context: { tokens: 0, window: 1, percent: 12 }, rateLimits: [], cost: { usd: 0.32 } } }))
@@ -390,4 +399,16 @@ test('Claude CLI threads in the same repo show in the Agents panel and the chip'
     expect(await deck.find({ type: 'Text', text: /ttys003/ })).toBeDefined()
     await deck.unmount()
   }
+})
+
+test('closed CLI threads from the last 7 days show in the panel, but not in the chip', async ($, on) => {
+  await started($, on, { closed: true })
+  const bar = await $.ui.mount({ plugin: 'workbench-bar', surface: 'desktop', ...BAND })
+  expect(((await bar.find({ key: 'agents' })) as any)?.props?.label).toBe('0')
+  await bar.press({ key: 'agents' })
+  await bar.unmount()
+  const deck = await $.ui.mount({ plugin: 'workbench-bar', surface: 'desktop', ...PANE })
+  expect(await deck.find({ type: 'Text', text: /Write the release notes/ })).toBeDefined()
+  expect(await deck.find({ type: 'Text', text: /claude -r old-id/ })).toBeDefined()
+  await deck.unmount()
 })

@@ -100,23 +100,63 @@ async function refreshThreads($: EngineInterface) {
   }))
 }
 
-// Claude CLI threads running in a terminal in this same repository
-type CliThread = { pid: string; tty: string; cwd: string; title: string; isWorking: boolean; at: number }
+// Claude CLI threads in this same repository: open in a terminal, or closed in the last 7 days
+type CliThread = { id: string; pid: string; tty: string; cwd: string; title: string; isWorking: boolean; isClosed: boolean; at: number }
 let cliThreads: CliThread[] = []
+let cliClosed: CliThread[] = []
+let cliScannedAt = -Infinity
+const CLI_DAYS = 7
+
+// The first user message in a transcript, as a one-line title, and the folder it ran in
+async function transcriptHead($: EngineInterface, path: string) {
+  const first = await $.process.run(['grep', '-m1', '"type":"user"', path], { timeoutMs: 5_000 })
+  const msg = JSON.parse(first.stdout || '{}') as { cwd?: string; message?: { content?: string | { type: string; text?: string }[] } }
+  const c = msg.message?.content
+  const text = typeof c === 'string' ? c : (c?.find(b => b.type === 'text')?.text ?? '')
+  return { title: text.trim() ? text.trim().split('\n')[0]!.slice(0, 80) : '', cwd: msg.cwd ?? '' }
+}
+
+// Closed CLI threads: transcripts from the CLI (entrypoint "cli") in this repo's project folders
+async function scanClosedCli($: EngineInterface, repo: string, home: string, t: number, open: Set<string>) {
+  const root = home + '/.claude/projects'
+  const dirs = (await $.fs.list(root)).filter(d => d.kind === 'dir' && d.name.includes('-' + repo.replace(/[/.]/g, '-')))
+  const recent: { path: string; at: number }[] = []
+  for (const d of dirs) {
+    for (const f of await $.fs.list(root + '/' + d.name)) {
+      if (f.kind !== 'file' || !f.name.endsWith('.jsonl')) continue
+      const path = root + '/' + d.name + '/' + f.name
+      const at = Number(((await $.fs.stat(path)) as { mtimeMs?: number }).mtimeMs ?? 0)
+      if (t - at < CLI_DAYS * 86_400_000 && !open.has(path)) recent.push({ path, at })
+    }
+  }
+  if (recent.length === 0) return []
+  const cli = await $.process.run(['grep', '-l', '"entrypoint":"cli"', ...recent.map(r => r.path)], { timeoutMs: 10_000 })
+  const isCli = new Set(cli.stdout.split('\n').filter(Boolean))
+  const found: CliThread[] = []
+  for (const r of recent.filter(x => isCli.has(x.path)).sort((a, b) => b.at - a.at).slice(0, 10)) {
+    const head = await transcriptHead($, r.path)
+    if (head.cwd && projectOf(head.cwd) !== repo) continue
+    const id = r.path.split('/').pop()!.replace(/\.jsonl$/, '')
+    found.push({ id, pid: '', tty: '', cwd: head.cwd, title: head.title || 'Terminal thread', isWorking: false, isClosed: true, at: r.at })
+  }
+  return found
+}
 
 async function refreshCli($: EngineInterface) {
   // A CLI thread is a `claude` process with a terminal; the desktop app's own threads have none (??)
   const ps = await $.process.run(['ps', '-axo', 'pid=,tty=,command='], { timeoutMs: 5_000 })
   if (ps.exitCode !== 0) return
+  const repo = projectOf(await $.session.root())
+  const t = await $.clock.now()
+  const home = (await $.env.get('HOME')) ?? ''
   const procs = ps.stdout
     .split('\n')
     .map(l => /^\s*(\d+)\s+(\S+)\s+(\S+)/.exec(l))
     .filter((m): m is RegExpExecArray => Boolean(m && m[2] !== '??' && /(^|\/)claude$|\/claude\/versions\/[^/]+$/.test(m[3] ?? '')))
     .map(m => ({ pid: m[1] as string, tty: m[2] as string }))
-  if (procs.length === 0) {
-    cliThreads = []
-    return
-  }
+  const open = new Set<string>()
+  const found: CliThread[] = []
+  if (procs.length > 0) {
   // Each process's working folder, from lsof: p<pid> then n<path>
   const ls = await $.process.run(['lsof', '-a', '-d', 'cwd', '-Fpn', '-p', procs.map(x => x.pid).join(',')], { timeoutMs: 5_000 })
   const cwds: Record<string, string> = {}
@@ -125,10 +165,6 @@ async function refreshCli($: EngineInterface) {
     if (line.startsWith('p')) pid = line.slice(1)
     else if (line.startsWith('n') && pid) cwds[pid] = line.slice(1)
   }
-  const repo = projectOf(await $.session.root())
-  const t = await $.clock.now()
-  const home = (await $.env.get('HOME')) ?? ''
-  const found: CliThread[] = []
   for (const x of procs) {
     const cwd = cwds[x.pid]
     if (!cwd || projectOf(cwd) !== repo) continue
@@ -148,14 +184,19 @@ async function refreshCli($: EngineInterface) {
         }
       }
       if (newest) {
-        const first = await $.process.run(['grep', '-m1', '"type":"user"', newest], { timeoutMs: 5_000 })
-        const msg = JSON.parse(first.stdout || '{}') as { message?: { content?: string | { type: string; text?: string }[] } }
-        const c = msg.message?.content
-        const text = typeof c === 'string' ? c : (c?.find(b => b.type === 'text')?.text ?? '')
-        if (text.trim()) title = text.trim().split('\n')[0]!.slice(0, 80)
+        open.add(newest)
+        title = (await transcriptHead($, newest)).title || title
       }
     } catch {}
-    found.push({ pid: x.pid, tty: x.tty, cwd, title, isWorking: at > 0 && t - at < 20_000, at })
+    found.push({ id: x.pid, pid: x.pid, tty: x.tty, cwd, title, isWorking: at > 0 && t - at < 20_000, isClosed: false, at })
+  }
+  }
+  // Closed threads change slowly, so look again at most once a minute
+  if (t - cliScannedAt > 60_000) {
+    cliScannedAt = t
+    try {
+      cliClosed = await scanClosedCli($, repo, home, t, open)
+    } catch {}
   }
   cliThreads = found
 }
@@ -1289,21 +1330,23 @@ export const register: Register = (on, options) => {
         <Text key="gap1"> </Text>,
         <Text key="h-run" bold>{'▾ Running · ' + live.length}</Text>,
         ...(live.length ? live.map(card) : [empty('No subagents running.')]),
-        ...(cliThreads.length
+        ...(cliThreads.length + cliClosed.length
           ? [
               <Text key="gap-cli"> </Text>,
-              group('agents', '⌨ Terminal threads', cliThreads.length),
+              group('agents', '⌨ Terminal threads', cliThreads.length + cliClosed.length),
               ...(isOpen('agents', '⌨ Terminal threads')
-                ? cliThreads.map(c => (
-                    <Box key={'cli-' + c.pid} flexDirection="row" columnGap={1} marginBottom={1}>
-                      {svg('cli-av-' + c.pid, avatarSvg('terminal', c.isWorking), 'terminal thread', 22, 20, c.isWorking)}
+                ? [...cliThreads, ...cliClosed].map(c => (
+                    <Box key={'cli-' + c.id} flexDirection="row" columnGap={1} marginBottom={1}>
+                      {svg('cli-av-' + c.id, avatarSvg('terminal', c.isWorking), 'terminal thread', 22, 20, c.isWorking)}
                       <Box flexDirection="column" flexGrow={1}>
                         <Box flexDirection="row">
                           <Text bold wrap="truncate-end">{c.title}</Text>
                           <Box flexGrow={1} />
-                          <Text color={c.isWorking ? GREEN : dim}>{c.isWorking ? '●' : '○'}</Text>
+                          <Text color={c.isWorking ? GREEN : dim}>{c.isClosed ? '✕' : c.isWorking ? '●' : '○'}</Text>
                         </Box>
-                        <Text color={dim} wrap="truncate-end">{'cli · ' + c.tty + ' · ' + (c.cwd.split('/').pop() ?? '') + (c.at ? ' · ' + ago(new Date(c.at).toISOString()) : '')}</Text>
+                        <Text color={dim} wrap="truncate-end">
+                          {(c.isClosed ? 'closed' : 'cli · ' + c.tty) + ' · ' + (c.cwd.split('/').pop() ?? '') + (c.at ? ' · ' + ago(new Date(c.at).toISOString()) : '') + (c.isClosed ? ' · claude -r ' + c.id : '')}
+                        </Text>
                       </Box>
                     </Box>
                   ))
