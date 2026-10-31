@@ -101,11 +101,28 @@ async function refreshThreads($: EngineInterface) {
 }
 
 // Claude CLI threads in this same repository: open in a terminal, or closed in the last 7 days
-type CliThread = { id: string; pid: string; tty: string; cwd: string; title: string; isWorking: boolean; isClosed: boolean; at: number }
+type CliThread = { id: string; pid: string; tty: string; cwd: string; title: string; isWorking: boolean; isClosed: boolean; at: number; stats?: CliStats }
+// What a CLI thread's transcript says: its model, effort, branch, tokens (each request counted once),
+// the last request's context, and its last step (a tool, or the start of what it wrote)
+type CliStats = { model: string; effort: string; branch: string; usage: Usage; context: number; requests: number; tool: string; text: string }
 let cliThreads: CliThread[] = []
 let cliClosed: CliThread[] = []
 let cliScannedAt = -Infinity
 const CLI_DAYS = 7
+
+const CLI_STATS_PL = "use JSON::PP; my $j = JSON::PP->new; my (%u, @ids, $model, $effort, $branch, $tool, $text, $ts);\nwhile (<>) {\n  next unless /\"type\":\"assistant\"/;\n  my $d = eval { $j->decode($_) } or next; my $m = $d->{message} or next;\n  $model = $m->{model} if $m->{model} && $m->{model} !~ /^</; $effort = $d->{effort} if $d->{effort}; $branch = $d->{gitBranch} if $d->{gitBranch}; $ts = $d->{timestamp};\n  for my $c (@{ $m->{content} || [] }) { if ($c->{type} eq 'tool_use') { $tool = $c->{name}; $text = '' } elsif ($c->{type} eq 'text' && $c->{text} =~ /\\S/) { ($text) = $c->{text} =~ /(\\S[^\\n]*)/; $tool = '' } }\n  push @ids, $m->{id} unless exists $u{ $m->{id} }; $u{ $m->{id} } = $m->{usage} || {};\n}\nmy %t = (input_tokens => 0, output_tokens => 0, cache_read_input_tokens => 0, cache_creation_input_tokens => 0);\nfor my $id (@ids) { $t{$_} += $u{$id}{$_} || 0 for keys %t }\nmy $l = @ids ? $u{ $ids[-1] } : {}; my $ctx = 0; $ctx += $l->{$_} || 0 for keys %t;\nprint $j->encode({ model => $model // '', effort => $effort // '', branch => $branch // '', usage => \\%t, context => $ctx, requests => scalar @ids, tool => $tool // '', text => substr($text // '', 0, 100), at => $ts // '' });"
+const cliStatsCache: Record<string, { at: number; stats: CliStats }> = {}
+
+// Read again only when the transcript has changed
+async function cliStats($: EngineInterface, path: string, at: number): Promise<CliStats | undefined> {
+  const hit = cliStatsCache[path]
+  if (hit && hit.at === at) return hit.stats
+  const r = await $.process.run(['perl', '-e', CLI_STATS_PL, path], { timeoutMs: 10_000 })
+  if (r.exitCode !== 0) return hit?.stats
+  const stats = JSON.parse(r.stdout) as CliStats
+  cliStatsCache[path] = { at, stats }
+  return stats
+}
 
 // The first user message in a transcript, as a one-line title, and the folder it ran in
 async function transcriptHead($: EngineInterface, path: string) {
@@ -137,7 +154,8 @@ async function scanClosedCli($: EngineInterface, repo: string, home: string, t: 
     const head = await transcriptHead($, r.path)
     if (head.cwd && projectOf(head.cwd) !== repo) continue
     const id = r.path.split('/').pop()!.replace(/\.jsonl$/, '')
-    found.push({ id, pid: '', tty: '', cwd: head.cwd, title: head.title || 'Terminal thread', isWorking: false, isClosed: true, at: r.at })
+    const stats = await cliStats($, r.path, r.at).catch(() => undefined)
+    found.push({ id, pid: '', tty: '', cwd: head.cwd, title: head.title || 'Terminal thread', isWorking: false, isClosed: true, at: r.at, stats })
   }
   return found
 }
@@ -223,7 +241,8 @@ async function refreshCli($: EngineInterface) {
       } catch {}
     }
     const id = tr.path ? tr.path.split('/').pop()!.replace(/\.jsonl$/, '') : x.pid
-    return { id, pid: x.pid, tty: x.tty, cwd, title, isWorking: tr.at > 0 && t - tr.at < 20_000, isClosed: false, at: tr.at }
+    const stats = tr.path ? await cliStats($, tr.path, tr.at).catch(() => undefined) : undefined
+    return { id, pid: x.pid, tty: x.tty, cwd, title, isWorking: tr.at > 0 && t - tr.at < 20_000, isClosed: false, at: tr.at, stats }
   }
   const found: CliThread[] = []
   for (const x of terminal) {
@@ -235,7 +254,19 @@ async function refreshCli($: EngineInterface) {
   const live: CliThread[] = []
   for (const x of mine) live.push({ ...(await thread(x, cwds[x.pid] ?? '')), isWorking: true })
   const saved = ((await $.store.get(key).catch(() => undefined)) as CliThread[] | undefined) ?? []
-  const gone = saved.filter(c => !live.some(l => l.pid === c.pid)).map(c => ({ ...c, isWorking: false, isClosed: true }))
+  const gone: CliThread[] = []
+  for (const c of saved.filter(c => !live.some(l => l.pid === c.pid))) {
+    // Ones saved before stats existed, or before the run ended: read them from the transcript
+    let stats = c.stats
+    if (c.id !== c.pid && c.cwd) {
+      const path = home + '/.claude/projects/' + c.cwd.replace(/[/.]/g, '-') + '/' + c.id + '.jsonl'
+      try {
+        const at = Number(((await $.fs.stat(path)) as { mtimeMs?: number }).mtimeMs ?? 0)
+        stats = (await cliStats($, path, at)) ?? stats
+      } catch {}
+    }
+    gone.push({ ...c, isWorking: false, isClosed: true, stats })
+  }
   cliSpawned = [...live, ...gone].slice(0, 20)
   if (cliSpawned.length) await $.store.set(key, cliSpawned).catch(() => {})
   // Closed threads change slowly, so look again at most once a minute
@@ -325,6 +356,12 @@ function shortModel(model: string): string {
   return /opus|sonnet|haiku|fable/i.exec(model)?.[0]?.toLowerCase() ?? model
 }
 
+// The family and version from a model id: claude-sonnet-5-5 → sonnet 5.5, claude-opus-4-1-20250805 → opus 4.1
+export function modelLabel(model: string): string {
+  const m = /(opus|sonnet|haiku|fable)-(\d+)(?:-(\d{1,2})(?!\d))?/i.exec(model)
+  return m ? m[1]!.toLowerCase() + ' ' + m[2] + (m[3] ? '.' + m[3] : '') : shortModel(model)
+}
+
 // A short name for a usage window: 5H, WK, FABLE, or the window's own name
 function windowName(kind: string): string {
   if (kind === 'context') return 'CTX'
@@ -411,7 +448,30 @@ function projectOf(cwd: string): string {
 
 const LIVE = ['running', 'pending', 'waiting']
 
+// What the mod learns about each agent (model, usage, steps, start) is kept per thread, so
+// /reload-plugins doesn't wipe it; agents that haven't made a request since would show "?"
+let agentsLoaded = false
+let agentsSavedAt = 0
+
+async function loadAgentInfo($: EngineInterface) {
+  agentsLoaded = true
+  const saved = (await $.store.get('agents:' + (await $.session.id())).catch(() => undefined)) as
+    | { models?: Record<string, string>; use?: Record<string, AgentUse>; starts?: Record<string, number> }
+    | undefined
+  for (const [id, m] of Object.entries(saved?.models ?? {})) models[id] ??= m
+  for (const [id, u] of Object.entries(saved?.use ?? {})) agentUse[id] ??= u
+  for (const [id, at] of Object.entries(saved?.starts ?? {})) agentStarts[id] ??= at
+}
+
+async function saveAgentInfo($: EngineInterface, isNow = false) {
+  const t = await $.clock.now()
+  if (!isNow && t - agentsSavedAt < 10_000) return
+  agentsSavedAt = t
+  await $.store.set('agents:' + (await $.session.id()), { models, use: agentUse, starts: agentStarts }).catch(() => {})
+}
+
 async function refreshAgents($: EngineInterface) {
+  if (!agentsLoaded) await loadAgentInfo($).catch(() => {})
   const list = await $.agent.list()
   const t = await $.clock.now()
   allAgents = list.map(a => {
@@ -1039,7 +1099,10 @@ export const register: Register = (on, options) => {
     u.tokens += all
     u.cost += costOf(model, usage)
     if (typeof e.effort === 'string') u.effort = e.effort
-    models[e.agentId] ??= shortModel(model)
+    // A request names the exact model; the spawn may only have said "sonnet"
+    const isNewModel = Boolean(model && models[e.agentId] !== model && (/\d/.test(model) || !models[e.agentId]))
+    if (isNewModel) models[e.agentId] = model
+    await saveAgentInfo($, isNewModel).catch(() => {})
     if (isDeckOpen) $.ui.invalidate('ui.render')
     return result
   })
@@ -1054,6 +1117,7 @@ export const register: Register = (on, options) => {
     u.stepTotal = Math.max(0, Math.round(input.total ?? u.stepTotal ?? 0))
     u.stepDone = Math.min(u.stepTotal || Infinity, Math.max(0, Math.round(input.done ?? u.stepDone ?? 0)))
     u.note = input.note?.trim() || undefined
+    await saveAgentInfo($, true).catch(() => {})
     if (isDeckOpen) $.ui.invalidate('ui.render')
     return { result: 'ok' }
   })
@@ -1080,8 +1144,9 @@ export const register: Register = (on, options) => {
     const r = await next(e.prompt.includes(STEP_TOOL) ? e : { ...e, prompt: e.prompt + STEP_BRIEF })
     const id = r.agentId ?? r.teammateId
     if (id) {
-      models[id] = shortModel(r.model ?? '?')
+      models[id] = r.model ?? '?'
       agentStarts[id] = await $.clock.now()
+      await saveAgentInfo($, true).catch(() => {})
       await refreshAgents($).catch(() => {})
       $.ui.invalidate('ui.render')
     }
@@ -1342,9 +1407,13 @@ export const register: Register = (on, options) => {
               <Text key={'gap-' + name}> </Text>,
               group('agents', name, list.length),
               ...(isOpen('agents', name)
-                ? list.map(c => (
+                ? list.map(c => {
+                    const st = c.stats
+                    const tokens = st ? (st.usage.input_tokens ?? 0) + (st.usage.output_tokens ?? 0) + (st.usage.cache_read_input_tokens ?? 0) + (st.usage.cache_creation_input_tokens ?? 0) : 0
+                    const last = st?.tool ? '▸ ' + st.tool : st?.text ? '“' + st.text + '”' : ''
+                    return (
                     <Box key={'cli-' + name + c.id} flexDirection="row" columnGap={1} marginBottom={1}>
-                      {svg('cli-av-' + c.id, avatarSvg('terminal', c.isWorking), 'terminal thread', 22, 20, c.isWorking)}
+                      {svg('cli-av-' + c.id, avatarSvg(st?.model || 'terminal', c.isWorking), 'terminal thread', 22, 20, c.isWorking)}
                       <Box flexDirection="column" flexGrow={1}>
                         <Box flexDirection="row">
                           <Text bold wrap="truncate-end">{c.title}</Text>
@@ -1352,11 +1421,21 @@ export const register: Register = (on, options) => {
                           <Text color={c.isWorking ? GREEN : dim}>{c.isClosed ? '✕' : c.isWorking ? '●' : '○'}</Text>
                         </Box>
                         <Text color={dim} wrap="truncate-end">
-                          {(c.isClosed ? 'closed' : 'cli · ' + (c.tty === '??' ? 'pid ' + c.pid : c.tty)) + ' · ' + (c.cwd.split('/').pop() ?? '') + (c.at ? ' · ' + ago(new Date(c.at).toISOString()) : '') + (c.isClosed && c.id !== c.pid ? ' · claude -r ' + c.id : '')}
+                          {(c.isClosed ? 'closed' : 'cli · ' + (c.tty === '??' ? 'pid ' + c.pid : c.tty)) + ' · ' + (st?.branch || (c.cwd.split('/').pop() ?? '')) + (c.at ? ' · ' + ago(new Date(c.at).toISOString()) : '') + (c.isClosed && c.id !== c.pid ? ' · claude -r ' + c.id : '')}
                         </Text>
+                        {st?.model ? (
+                          <Box flexDirection="row">
+                            <Text color={modelColor(st.model)}>{modelLabel(st.model)}</Text>
+                            <Text color={dim} wrap="truncate-end">
+                              {(st.effort ? ' · ' + st.effort : '') + ' · ' + st.requests + ' req · ' + fmtTokens(tokens) + ' tok · ≈$' + costOf(st.model, st.usage).toFixed(2) + ' · ctx ' + Math.round((100 * st.context) / windowOf(st.model)) + '%'}
+                            </Text>
+                          </Box>
+                        ) : null}
+                        {last && !c.isClosed ? <Text color={dim} wrap="truncate-end">{last}</Text> : null}
                       </Box>
                     </Box>
-                  ))
+                    )
+                  })
                 : []),
             ]
           : []
@@ -1370,7 +1449,7 @@ export const register: Register = (on, options) => {
         const meta = [u ? 'ctx ' + ctx + '%' : '', u ? fmtTokens(u.tokens) : '', u ? '≈$' + u.cost.toFixed(2) : '', clock((a.endedAt ?? t) - a.startedAt)].filter(Boolean).join(' · ')
         return (
           <Box key={'agent-' + a.id} flexDirection="row" columnGap={1} marginBottom={1}>
-            {svg('av-' + a.id, avatarSvg(a.model, isLive), a.model + ' agent', 22, 20, isLive)}
+            {svg('av-' + a.id, avatarSvg(a.model, isLive), modelLabel(a.model) + ' agent', 22, 20, isLive)}
             <Box flexDirection="column" flexGrow={1}>
               <Box flexDirection="row">
                 <Text bold wrap="truncate-end">{a.name}</Text>
@@ -1378,7 +1457,7 @@ export const register: Register = (on, options) => {
                 <Text color={isLive ? GREEN : a.status === 'completed' ? dim : RED}>{isLive ? '●' : a.status === 'completed' ? '✓' : '✗'}</Text>
               </Box>
               <Text wrap="truncate-end">
-                <Text color={modelColor(a.model)}>{a.model}</Text>
+                <Text color={modelColor(a.model)}>{modelLabel(a.model)}</Text>
                 <Text color={dim}>{(u?.effort ? ' · ' + u.effort : '') + ' · ' + a.type}</Text>
               </Text>
               <Box flexDirection="row">

@@ -1,4 +1,5 @@
 import { expect, mock, test } from 'claude-code/testing'
+import { modelLabel } from '../hooks/register'
 
 const BAND = { component: 'AbovePrompt', props: { hasSurvey: false, isWorking: false, maxRows: 5, bodyColumns: 140 } as any } as const
 
@@ -40,6 +41,8 @@ function fakes(on: any, start: string, opts: { linearTeam?: string; agents?: unk
     // A background command is cut loose (its shell's parent is 1), but the env names the thread
     if (argv[0] === 'ps' && argv[1] === 'eww') return { value: { exitCode: 0, stdout: '  902 claude -p hi HOME=/home/me CLAUDE_PID=900 CLAUDE_CODE_SESSION_ID=this-thread\n  101 claude --resume CLAUDE_PID=555\n', stderr: '' } }
     if (argv[0] === 'ps') return { value: { exitCode: 0, stdout: mine + (!opts.cli ? '' : '  101 1 ttys003  claude --resume\n  102 1 ??  /Apps/claude\n  103 1 ttys004  vim\n'), stderr: '' } }
+    if (argv[0] === 'perl')
+      return { value: { exitCode: 0, stdout: JSON.stringify({ model: 'claude-opus-5-5', effort: 'high', branch: 'feat/billing', usage: { input_tokens: 1000, output_tokens: 20000, cache_read_input_tokens: 1_000_000, cache_creation_input_tokens: 50_000 }, context: 250_000, requests: 42, tool: 'Bash', text: '' }), stderr: '' } }
     if (argv[0] === 'lsof') return { value: { exitCode: 0, stdout: 'p101\nfcwd\nn/home/me/code/demo/.claude/worktrees/w\np902\nfcwd\nn/tmp/billing\n', stderr: '' } }
     // One closed CLI thread in this repo's transcripts
     if (argv[0] === 'grep' && argv[1] === '-l') return { value: { exitCode: 0, stdout: opts.closed ? argv.filter(a => a.endsWith('old-id.jsonl')).join('\n') : '', stderr: '' } }
@@ -432,11 +435,40 @@ test('CLI threads this thread started show under Started here, and stay after th
   await bar.press({ key: 'agents' })
   await bar.unmount()
   let deck = await $.ui.mount({ plugin: 'workbench-bar', surface: 'desktop', ...PANE })
-  expect(await deck.find({ type: 'Text', text: /pid 902 · billing/ })).toBeDefined()
+  expect(await deck.find({ type: 'Text', text: /pid 902 · feat\/billing/ })).toBeDefined()
+  expect(await deck.find({ type: 'Text', text: /^opus 5\.5$/ })).toBeDefined()
+  expect(await deck.find({ type: 'Text', text: /· high · 42 req · 1\.1M tok · ≈\$\d+\.\d\d · ctx 25%/ })).toBeDefined()
+  expect(await deck.find({ type: 'Text', text: /▸ Bash/ })).toBeDefined()
   await deck.unmount()
   spawned.live = false
   await clock.advance(10_000)
   deck = await $.ui.mount({ plugin: 'workbench-bar', surface: 'desktop', ...PANE })
-  expect(await deck.find({ type: 'Text', text: /closed · billing.*claude -r abc/ })).toBeDefined()
+  expect(await deck.find({ type: 'Text', text: /closed · feat\/billing.*claude -r abc/ })).toBeDefined()
+  expect(await deck.find({ type: 'Text', text: /· high · 42 req/ })).toBeDefined()
+  await deck.unmount()
+})
+
+test('agent cards name the model version, not only the family', async () => {
+  expect(modelLabel('claude-sonnet-5-5')).toBe('sonnet 5.5')
+  expect(modelLabel('claude-opus-4-1-20250805')).toBe('opus 4.1')
+  expect(modelLabel('claude-haiku-4-5-20251001')).toBe('haiku 4.5')
+  expect(modelLabel('claude-opus-4-20250514')).toBe('opus 4')
+  expect(modelLabel('sonnet')).toBe('sonnet')
+})
+
+test('after /reload-plugins, agent cards keep the model and steps saved for this thread', async ($, on) => {
+  const clock = mock.clock(on)
+  fakes(on, 'state', { agents: [{ id: 'a1', description: 'Launch emails', type: 'general-purpose', status: 'running' }] })
+  const saved: Record<string, unknown> = { 'agents:this-thread': { models: { a1: 'claude-opus-5-5' }, use: { a1: { context: 0, window: 1_000_000, tokens: 0, cost: 0, stepDone: 3, stepTotal: 9 } }, starts: {} } }
+  on('store.get', async ($: unknown, e: any) => ({ value: saved[e.key ?? e] }))
+  on('store.set', async () => ({ value: undefined }))
+  await ($ as any).session.start({ cwd: '/home/me/code/demo', surface: 'desktop' })
+  await clock.advance(5_100)
+  const bar = await $.ui.mount({ plugin: 'workbench-bar', surface: 'desktop', ...BAND })
+  await bar.press({ key: 'agents' })
+  await bar.unmount()
+  const deck = await $.ui.mount({ plugin: 'workbench-bar', surface: 'desktop', ...PANE })
+  expect(await deck.find({ type: 'Text', text: /^opus 5\.5$/ })).toBeDefined()
+  expect(await deck.find({ type: 'Text', text: /3\/9/ })).toBeDefined()
   await deck.unmount()
 })
