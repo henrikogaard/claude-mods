@@ -449,3 +449,20 @@ test('agent cards name the model version, not only the family', async () => {
   expect(modelLabel('claude-opus-4-20250514')).toBe('opus 4')
   expect(modelLabel('sonnet')).toBe('sonnet')
 })
+
+test('after /reload-plugins, agent cards keep the model and steps saved for this thread', async ($, on) => {
+  const clock = mock.clock(on)
+  fakes(on, 'state', { agents: [{ id: 'a1', description: 'Launch emails', type: 'general-purpose', status: 'running' }] })
+  const saved: Record<string, unknown> = { 'agents:this-thread': { models: { a1: 'claude-opus-5-5' }, use: { a1: { context: 0, window: 1_000_000, tokens: 0, cost: 0, stepDone: 3, stepTotal: 9 } }, starts: {} } }
+  on('store.get', async ($: unknown, e: any) => ({ value: saved[e.key ?? e] }))
+  on('store.set', async () => ({ value: undefined }))
+  await ($ as any).session.start({ cwd: '/home/me/code/demo', surface: 'desktop' })
+  await clock.advance(5_100)
+  const bar = await $.ui.mount({ plugin: 'workbench-bar', surface: 'desktop', ...BAND })
+  await bar.press({ key: 'agents' })
+  await bar.unmount()
+  const deck = await $.ui.mount({ plugin: 'workbench-bar', surface: 'desktop', ...PANE })
+  expect(await deck.find({ type: 'Text', text: /^opus 5\.5$/ })).toBeDefined()
+  expect(await deck.find({ type: 'Text', text: /3\/9/ })).toBeDefined()
+  await deck.unmount()
+})

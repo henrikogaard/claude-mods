@@ -417,7 +417,30 @@ function projectOf(cwd: string): string {
 
 const LIVE = ['running', 'pending', 'waiting']
 
+// What the mod learns about each agent (model, usage, steps, start) is kept per thread, so
+// /reload-plugins doesn't wipe it; agents that haven't made a request since would show "?"
+let agentsLoaded = false
+let agentsSavedAt = 0
+
+async function loadAgentInfo($: EngineInterface) {
+  agentsLoaded = true
+  const saved = (await $.store.get('agents:' + (await $.session.id())).catch(() => undefined)) as
+    | { models?: Record<string, string>; use?: Record<string, AgentUse>; starts?: Record<string, number> }
+    | undefined
+  for (const [id, m] of Object.entries(saved?.models ?? {})) models[id] ??= m
+  for (const [id, u] of Object.entries(saved?.use ?? {})) agentUse[id] ??= u
+  for (const [id, at] of Object.entries(saved?.starts ?? {})) agentStarts[id] ??= at
+}
+
+async function saveAgentInfo($: EngineInterface, isNow = false) {
+  const t = await $.clock.now()
+  if (!isNow && t - agentsSavedAt < 10_000) return
+  agentsSavedAt = t
+  await $.store.set('agents:' + (await $.session.id()), { models, use: agentUse, starts: agentStarts }).catch(() => {})
+}
+
 async function refreshAgents($: EngineInterface) {
+  if (!agentsLoaded) await loadAgentInfo($).catch(() => {})
   const list = await $.agent.list()
   const t = await $.clock.now()
   allAgents = list.map(a => {
@@ -1046,7 +1069,9 @@ export const register: Register = (on, options) => {
     u.cost += costOf(model, usage)
     if (typeof e.effort === 'string') u.effort = e.effort
     // A request names the exact model; the spawn may only have said "sonnet"
-    if (model && (/\d/.test(model) || !models[e.agentId])) models[e.agentId] = model
+    const isNewModel = Boolean(model && models[e.agentId] !== model && (/\d/.test(model) || !models[e.agentId]))
+    if (isNewModel) models[e.agentId] = model
+    await saveAgentInfo($, isNewModel).catch(() => {})
     if (isDeckOpen) $.ui.invalidate('ui.render')
     return result
   })
@@ -1061,6 +1086,7 @@ export const register: Register = (on, options) => {
     u.stepTotal = Math.max(0, Math.round(input.total ?? u.stepTotal ?? 0))
     u.stepDone = Math.min(u.stepTotal || Infinity, Math.max(0, Math.round(input.done ?? u.stepDone ?? 0)))
     u.note = input.note?.trim() || undefined
+    await saveAgentInfo($, true).catch(() => {})
     if (isDeckOpen) $.ui.invalidate('ui.render')
     return { result: 'ok' }
   })
@@ -1089,6 +1115,7 @@ export const register: Register = (on, options) => {
     if (id) {
       models[id] = r.model ?? '?'
       agentStarts[id] = await $.clock.now()
+      await saveAgentInfo($, true).catch(() => {})
       await refreshAgents($).catch(() => {})
       $.ui.invalidate('ui.render')
     }
