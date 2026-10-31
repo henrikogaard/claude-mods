@@ -254,7 +254,19 @@ async function refreshCli($: EngineInterface) {
   const live: CliThread[] = []
   for (const x of mine) live.push({ ...(await thread(x, cwds[x.pid] ?? '')), isWorking: true })
   const saved = ((await $.store.get(key).catch(() => undefined)) as CliThread[] | undefined) ?? []
-  const gone = saved.filter(c => !live.some(l => l.pid === c.pid)).map(c => ({ ...c, isWorking: false, isClosed: true }))
+  const gone: CliThread[] = []
+  for (const c of saved.filter(c => !live.some(l => l.pid === c.pid))) {
+    // Ones saved before stats existed, or before the run ended: read them from the transcript
+    let stats = c.stats
+    if (c.id !== c.pid && c.cwd) {
+      const path = home + '/.claude/projects/' + c.cwd.replace(/[/.]/g, '-') + '/' + c.id + '.jsonl'
+      try {
+        const at = Number(((await $.fs.stat(path)) as { mtimeMs?: number }).mtimeMs ?? 0)
+        stats = (await cliStats($, path, at)) ?? stats
+      } catch {}
+    }
+    gone.push({ ...c, isWorking: false, isClosed: true, stats })
+  }
   cliSpawned = [...live, ...gone].slice(0, 20)
   if (cliSpawned.length) await $.store.set(key, cliSpawned).catch(() => {})
   // Closed threads change slowly, so look again at most once a minute

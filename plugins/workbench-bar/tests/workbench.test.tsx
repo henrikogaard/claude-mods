@@ -444,6 +444,7 @@ test('CLI threads this thread started show under Started here, and stay after th
   await clock.advance(10_000)
   deck = await $.ui.mount({ plugin: 'workbench-bar', surface: 'desktop', ...PANE })
   expect(await deck.find({ type: 'Text', text: /closed · feat\/billing.*claude -r abc/ })).toBeDefined()
+  expect(await deck.find({ type: 'Text', text: /· high · 42 req/ })).toBeDefined()
   await deck.unmount()
 })
 
