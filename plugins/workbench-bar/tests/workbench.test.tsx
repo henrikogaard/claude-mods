@@ -1,4 +1,5 @@
 import { expect, mock, test } from 'claude-code/testing'
+import { modelLabel } from '../hooks/register'
 
 const BAND = { component: 'AbovePrompt', props: { hasSurvey: false, isWorking: false, maxRows: 5, bodyColumns: 140 } as any } as const
 
@@ -439,4 +440,12 @@ test('CLI threads this thread started show under Started here, and stay after th
   deck = await $.ui.mount({ plugin: 'workbench-bar', surface: 'desktop', ...PANE })
   expect(await deck.find({ type: 'Text', text: /closed · billing.*claude -r abc/ })).toBeDefined()
   await deck.unmount()
+})
+
+test('agent cards name the model version, not only the family', async () => {
+  expect(modelLabel('claude-sonnet-5-5')).toBe('sonnet 5.5')
+  expect(modelLabel('claude-opus-4-1-20250805')).toBe('opus 4.1')
+  expect(modelLabel('claude-haiku-4-5-20251001')).toBe('haiku 4.5')
+  expect(modelLabel('claude-opus-4-20250514')).toBe('opus 4')
+  expect(modelLabel('sonnet')).toBe('sonnet')
 })

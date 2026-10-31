@@ -325,6 +325,12 @@ function shortModel(model: string): string {
   return /opus|sonnet|haiku|fable/i.exec(model)?.[0]?.toLowerCase() ?? model
 }
 
+// The family and version from a model id: claude-sonnet-5-5 → sonnet 5.5, claude-opus-4-1-20250805 → opus 4.1
+export function modelLabel(model: string): string {
+  const m = /(opus|sonnet|haiku|fable)-(\d+)(?:-(\d{1,2})(?!\d))?/i.exec(model)
+  return m ? m[1]!.toLowerCase() + ' ' + m[2] + (m[3] ? '.' + m[3] : '') : shortModel(model)
+}
+
 // A short name for a usage window: 5H, WK, FABLE, or the window's own name
 function windowName(kind: string): string {
   if (kind === 'context') return 'CTX'
@@ -1039,7 +1045,8 @@ export const register: Register = (on, options) => {
     u.tokens += all
     u.cost += costOf(model, usage)
     if (typeof e.effort === 'string') u.effort = e.effort
-    models[e.agentId] ??= shortModel(model)
+    // A request names the exact model; the spawn may only have said "sonnet"
+    if (model && (/\d/.test(model) || !models[e.agentId])) models[e.agentId] = model
     if (isDeckOpen) $.ui.invalidate('ui.render')
     return result
   })
@@ -1080,7 +1087,7 @@ export const register: Register = (on, options) => {
     const r = await next(e.prompt.includes(STEP_TOOL) ? e : { ...e, prompt: e.prompt + STEP_BRIEF })
     const id = r.agentId ?? r.teammateId
     if (id) {
-      models[id] = shortModel(r.model ?? '?')
+      models[id] = r.model ?? '?'
       agentStarts[id] = await $.clock.now()
       await refreshAgents($).catch(() => {})
       $.ui.invalidate('ui.render')
@@ -1370,7 +1377,7 @@ export const register: Register = (on, options) => {
         const meta = [u ? 'ctx ' + ctx + '%' : '', u ? fmtTokens(u.tokens) : '', u ? '≈$' + u.cost.toFixed(2) : '', clock((a.endedAt ?? t) - a.startedAt)].filter(Boolean).join(' · ')
         return (
           <Box key={'agent-' + a.id} flexDirection="row" columnGap={1} marginBottom={1}>
-            {svg('av-' + a.id, avatarSvg(a.model, isLive), a.model + ' agent', 22, 20, isLive)}
+            {svg('av-' + a.id, avatarSvg(a.model, isLive), modelLabel(a.model) + ' agent', 22, 20, isLive)}
             <Box flexDirection="column" flexGrow={1}>
               <Box flexDirection="row">
                 <Text bold wrap="truncate-end">{a.name}</Text>
@@ -1378,7 +1385,7 @@ export const register: Register = (on, options) => {
                 <Text color={isLive ? GREEN : a.status === 'completed' ? dim : RED}>{isLive ? '●' : a.status === 'completed' ? '✓' : '✗'}</Text>
               </Box>
               <Text wrap="truncate-end">
-                <Text color={modelColor(a.model)}>{a.model}</Text>
+                <Text color={modelColor(a.model)}>{modelLabel(a.model)}</Text>
                 <Text color={dim}>{(u?.effort ? ' · ' + u.effort : '') + ' · ' + a.type}</Text>
               </Text>
               <Box flexDirection="row">
