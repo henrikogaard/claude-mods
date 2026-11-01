@@ -510,3 +510,17 @@ test('runs sharing a folder each get their own transcript, one card each, and HE
   expect(await deck.find({ key: 'grp-agents:✕ Closed' })).toBeUndefined()
   await deck.unmount()
 })
+
+test('a closed run saved twice shows once', async ($, on) => {
+  const run = { id: 'dup', tty: '??', cwd: '/tmp/x', title: 'Saved twice', isWorking: false, isClosed: true, at: 1 }
+  const saved: Record<string, unknown> = { 'spawned:this-thread': [{ ...run, pid: '1' }, { ...run, pid: '2' }] }
+  on('store.get', async ($: unknown, e: any) => ({ value: saved[e.key ?? e] }))
+  on('store.set', async () => ({ value: undefined }))
+  await started($, on)
+  const bar = await $.ui.mount({ plugin: 'workbench-bar', surface: 'desktop', ...BAND })
+  await bar.press({ key: 'agents' })
+  await bar.unmount()
+  const deck = await $.ui.mount({ plugin: 'workbench-bar', surface: 'desktop', ...PANE })
+  expect(((await deck.findAll({ type: 'Text', text: /Saved twice/ })) as any[]).length).toBe(1)
+  await deck.unmount()
+})

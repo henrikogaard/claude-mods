@@ -274,15 +274,17 @@ async function refreshCli($: EngineInterface) {
   // One with no transcript has nothing to show and can't be resumed
   for (const c of saved.filter(c => c.id !== c.pid && !live.some(l => l.pid === c.pid || l.id === c.id))) {
     // Ones saved before stats existed, or before the run ended: read them from the transcript
+    if (gone.some(g => g.id === c.id)) continue
     let stats = c.stats
+    let at = c.at
     if (c.cwd) {
       const path = home + '/.claude/projects/' + c.cwd.replace(/[/.]/g, '-') + '/' + c.id + '.jsonl'
       try {
-        const at = Number(((await $.fs.stat(path)) as { mtimeMs?: number }).mtimeMs ?? 0)
+        at = Number(((await $.fs.stat(path)) as { mtimeMs?: number }).mtimeMs ?? 0) || at
         stats = (await cliStats($, path, at)) ?? stats
       } catch {}
     }
-    gone.push({ ...c, isWorking: false, isClosed: true, stats })
+    gone.push({ ...c, isWorking: false, isClosed: true, stats, at })
   }
   cliSpawned = [...live, ...gone].slice(0, 20)
   if (cliSpawned.length) await $.store.set(key, cliSpawned).catch(() => {})
