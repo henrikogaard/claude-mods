@@ -164,22 +164,38 @@ async function scanClosedCli($: EngineInterface, repo: string, home: string, t: 
 let cliSpawned: CliThread[] = []
 let selfPid = ''
 
-// A transcript's path and age: the newest .jsonl in ~/.claude/projects/<cwd with / and . as ->
-async function newestTranscript($: EngineInterface, home: string, cwd: string, skip: string) {
+// Letters and digits only, so a prompt as `ps` escapes it (\\012, \\M-b) compares with the transcript's
+const textKey = (text: string) => text.replace(/\\(?:M[-^].|\^.|\d{3})/g, ' ').replace(/[^A-Za-z0-9]/g, '').toLowerCase()
+const headCache: Record<string, { title: string; cwd: string }> = {}
+
+async function cachedHead($: EngineInterface, path: string) {
+  const hit = headCache[path]
+  if (hit) return hit
+  const head = await transcriptHead($, path)
+  if (head.title) headCache[path] = head
+  return head
+}
+
+// A process's transcript, in ~/.claude/projects/<cwd with / and . as ->. Runs can share a folder, so a
+// prompt given on the command line must match the transcript's first message; else take the newest
+async function findTranscript($: EngineInterface, home: string, cwd: string, skip: string, args: string, claimed: Set<string>) {
   const dir = home + '/.claude/projects/' + cwd.replace(/[/.]/g, '-')
-  let path = ''
-  let at = 0
+  const files: { path: string; at: number }[] = []
   try {
     for (const f of await $.fs.list(dir)) {
-      if (f.kind !== 'file' || !f.name.endsWith('.jsonl') || f.name === skip) continue
-      const m = Number(((await $.fs.stat(dir + '/' + f.name)) as { mtimeMs?: number }).mtimeMs ?? 0)
-      if (m > at) {
-        at = m
-        path = dir + '/' + f.name
-      }
+      const path = dir + '/' + f.name
+      if (f.kind !== 'file' || !f.name.endsWith('.jsonl') || f.name === skip || claimed.has(path)) continue
+      files.push({ path, at: Number(((await $.fs.stat(path)) as { mtimeMs?: number }).mtimeMs ?? 0) })
     }
   } catch {}
-  return { path, at }
+  files.sort((a, b) => b.at - a.at)
+  const key = textKey(args)
+  if (key.length < 40) return files[0] ?? { path: '', at: 0 }
+  for (const f of files.slice(0, 30)) {
+    const title = textKey((await cachedHead($, f.path).catch(() => ({ title: '' }))).title)
+    if (title.length >= 8 && key.includes(title)) return f
+  }
+  return { path: '', at: 0 }
 }
 
 async function refreshCli($: EngineInterface) {
@@ -192,7 +208,7 @@ async function refreshCli($: EngineInterface) {
     .split('\n')
     .map(l => /^\s*(\d+)\s+(\d+)\s+(\S+)\s+(\S+)(.*)$/.exec(l))
     .filter((m): m is RegExpExecArray => Boolean(m))
-    .map(m => ({ pid: m[1] as string, ppid: m[2] as string, tty: m[3] as string, isClaude: /(^|\/)claude$|\/claude\/versions\/[^/]+$/.test(m[4] ?? ''), isThisPs: /(^|\/)ps$/.test(m[4] ?? '') && (m[5] ?? '').includes('pid=,ppid=,tty=,command=') }))
+    .map(m => ({ pid: m[1] as string, ppid: m[2] as string, tty: m[3] as string, isClaude: /(^|\/)claude$|\/claude\/versions\/[^/]+$/.test(m[4] ?? ''), args: m[5] ?? '', isThisPs: /(^|\/)ps$/.test(m[4] ?? '') && (m[5] ?? '').includes('pid=,ppid=,tty=,command=') }))
   // This thread's own process started the ps above, so it's that ps's parent
   selfPid = rows.find(r => r.isThisPs)?.ppid ?? selfPid
   const parent: Record<string, string> = {}
@@ -231,41 +247,44 @@ async function refreshCli($: EngineInterface) {
   }
   const open = new Set<string>()
   // This thread writes its own transcript all the time, so never take that one
-  const thread = async (x: { pid: string; tty: string }, cwd: string): Promise<CliThread> => {
-    const tr = await newestTranscript($, home, cwd, sessionId + '.jsonl')
+  const thread = async (x: { pid: string; tty: string; args: string }, cwd: string): Promise<CliThread> => {
+    const tr = await findTranscript($, home, cwd, sessionId + '.jsonl', x.args, open)
     let title = 'Terminal thread'
     if (tr.path) {
       open.add(tr.path)
       try {
-        title = (await transcriptHead($, tr.path)).title || title
+        title = (await cachedHead($, tr.path)).title || title
       } catch {}
     }
     const id = tr.path ? tr.path.split('/').pop()!.replace(/\.jsonl$/, '') : x.pid
     const stats = tr.path ? await cliStats($, tr.path, tr.at).catch(() => undefined) : undefined
     return { id, pid: x.pid, tty: x.tty, cwd, title, isWorking: tr.at > 0 && t - tr.at < 20_000, isClosed: false, at: tr.at, stats }
   }
+  // Started here: wherever they run. Ones that ended stay listed as closed
+  const key = 'spawned:' + sessionId
+  const live: CliThread[] = []
+  for (const x of mine) live.push({ ...(await thread(x, cwds[x.pid] ?? '')), isWorking: true })
   const found: CliThread[] = []
   for (const x of terminal) {
     const cwd = cwds[x.pid]
     if (cwd && projectOf(cwd) === repo) found.push(await thread(x, cwd))
   }
-  // Started here: wherever they run. Ones that ended stay listed as closed
-  const key = 'spawned:' + sessionId
-  const live: CliThread[] = []
-  for (const x of mine) live.push({ ...(await thread(x, cwds[x.pid] ?? '')), isWorking: true })
   const saved = ((await $.store.get(key).catch(() => undefined)) as CliThread[] | undefined) ?? []
   const gone: CliThread[] = []
-  for (const c of saved.filter(c => !live.some(l => l.pid === c.pid))) {
+  // One with no transcript has nothing to show and can't be resumed
+  for (const c of saved.filter(c => c.id !== c.pid && !live.some(l => l.pid === c.pid || l.id === c.id))) {
     // Ones saved before stats existed, or before the run ended: read them from the transcript
+    if (gone.some(g => g.id === c.id)) continue
     let stats = c.stats
-    if (c.id !== c.pid && c.cwd) {
+    let at = c.at
+    if (c.cwd) {
       const path = home + '/.claude/projects/' + c.cwd.replace(/[/.]/g, '-') + '/' + c.id + '.jsonl'
       try {
-        const at = Number(((await $.fs.stat(path)) as { mtimeMs?: number }).mtimeMs ?? 0)
+        at = Number(((await $.fs.stat(path)) as { mtimeMs?: number }).mtimeMs ?? 0) || at
         stats = (await cliStats($, path, at)) ?? stats
       } catch {}
     }
-    gone.push({ ...c, isWorking: false, isClosed: true, stats })
+    gone.push({ ...c, isWorking: false, isClosed: true, stats, at })
   }
   cliSpawned = [...live, ...gone].slice(0, 20)
   if (cliSpawned.length) await $.store.set(key, cliSpawned).catch(() => {})
@@ -1421,7 +1440,7 @@ export const register: Register = (on, options) => {
                           <Text color={c.isWorking ? GREEN : dim}>{c.isClosed ? '✕' : c.isWorking ? '●' : '○'}</Text>
                         </Box>
                         <Text color={dim} wrap="truncate-end">
-                          {(c.isClosed ? 'closed' : 'cli · ' + (c.tty === '??' ? 'pid ' + c.pid : c.tty)) + ' · ' + (st?.branch || (c.cwd.split('/').pop() ?? '')) + (c.at ? ' · ' + ago(new Date(c.at).toISOString()) : '') + (c.isClosed && c.id !== c.pid ? ' · claude -r ' + c.id : '')}
+                          {(c.isClosed ? 'closed' : 'cli · ' + (c.tty === '??' ? 'pid ' + c.pid : c.tty)) + ' · ' + (st?.branch && st.branch !== 'HEAD' ? st.branch : (c.cwd.split('/').pop() ?? '')) + (c.at ? ' · ' + ago(new Date(c.at).toISOString()) : '') + (c.isClosed && c.id !== c.pid ? ' · claude -r ' + c.id : '')}
                         </Text>
                         {st?.model ? (
                           <Box flexDirection="row">
@@ -1481,8 +1500,12 @@ export const register: Register = (on, options) => {
         <Text key="gap1"> </Text>,
         <Text key="h-run" bold>{'▾ Running · ' + live.length}</Text>,
         ...(live.length ? live.map(card) : [empty('No subagents running.')]),
-        ...cliGroup('⤷ Started here', cliSpawned),
-        ...cliGroup('⌨ Terminal threads', [...cliThreads, ...cliClosed]),
+        ...cliGroup('⤷ Started here', cliSpawned.filter(c => !c.isClosed)),
+        ...cliGroup('⌨ Terminal threads', cliThreads),
+        ...cliGroup(
+          '✕ Closed',
+          [...cliSpawned.filter(c => c.isClosed), ...cliClosed.filter(c => !cliSpawned.some(x => x.id === c.id))].sort((a, b) => b.at - a.at),
+        ),
         ...(done.length ? [<Text key="gap2"> </Text>, <Text key="h-done" bold>{'▾ Finished · ' + done.length}</Text>, ...done.slice(-10).reverse().map(card)] : []),
       ]
     } else if (section === 'github') {
