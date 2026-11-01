@@ -4,7 +4,7 @@ import { modelLabel } from '../hooks/register'
 const BAND = { component: 'AbovePrompt', props: { hasSurvey: false, isWorking: false, maxRows: 5, bodyColumns: 140 } as any } as const
 
 // Fakes for the desktop app's sidebar, Linear, gh and the session
-function fakes(on: any, start: string, opts: { linearTeam?: string; agents?: unknown[]; branch?: string; calls?: string[]; cli?: boolean; closed?: boolean; spawned?: { live: boolean } } = {}) {
+function fakes(on: any, start: string, opts: { linearTeam?: string; agents?: unknown[]; branch?: string; calls?: string[]; cli?: boolean; closed?: boolean; spawned?: { live: boolean }; sharedFolder?: boolean } = {}) {
   const state = { groupBy: start, sortBy: 'created' }
   on('mcp.call', async ($: unknown, e: { server: string; tool: string; args: Record<string, unknown> }) => {
     const ok = (data: unknown) => ({ value: { isError: false, content: [{ type: 'text', text: JSON.stringify(data) }] } })
@@ -39,6 +39,20 @@ function fakes(on: any, start: string, opts: { linearTeam?: string; agents?: unk
     // This thread is 900 (the parent of the ps it runs); a background shell (901) started `claude -p` (902)
     const mine = '  900 1 ??  /Apps/claude\n  950 900 ??  ps -axo pid=,ppid=,tty=,command=\n' + (opts.spawned?.live ? '  901 1 ??  /bin/sh\n  902 901 ??  claude -p hi\n' : '')
     // A background command is cut loose (its shell's parent is 1), but the env names the thread
+    // Two runs in one folder: the first was started before the newer transcript's run
+    if (opts.sharedFolder && argv[0] === 'ps' && argv[1] === 'eww') return { value: { exitCode: 0, stdout: '  902 x CLAUDE_PID=900\n  903 x CLAUDE_PID=900\n', stderr: '' } }
+    if (opts.sharedFolder && argv[0] === 'ps')
+      return {
+        value: {
+          exitCode: 0,
+          stdout:
+            '  900 1 ??  /Apps/claude\n  950 900 ??  ps -axo pid=,ppid=,tty=,command=\n  902 1 ??  claude -p # Owner\\M-b\\M^@\\M^Sdevice unlock before a merge\\012Read the docs and fix it all\n  903 1 ??  claude -p # Finish Server Projects, all of it\\012A previous helper built this\n',
+          stderr: '',
+        },
+      }
+    if (opts.sharedFolder && argv[0] === 'lsof') return { value: { exitCode: 0, stdout: 'p902\nfcwd\nn/tmp/billing\np903\nfcwd\nn/tmp/billing\n', stderr: '' } }
+    if (opts.sharedFolder && argv[0] === 'grep') return { value: { exitCode: 0, stdout: JSON.stringify({ type: 'user', message: { content: String(argv[3]).endsWith('new.jsonl') ? '# Finish Server Projects, all of it' : '# Owner–device unlock before a merge' } }), stderr: '' } }
+    if (opts.sharedFolder && argv[0] === 'perl') return { value: { exitCode: 0, stdout: JSON.stringify({ model: 'claude-opus-5-5', effort: 'high', branch: 'HEAD', usage: {}, context: 0, requests: 1, tool: '', text: '' }), stderr: '' } }
     if (argv[0] === 'ps' && argv[1] === 'eww') return { value: { exitCode: 0, stdout: '  902 claude -p hi HOME=/home/me CLAUDE_PID=900 CLAUDE_CODE_SESSION_ID=this-thread\n  101 claude --resume CLAUDE_PID=555\n', stderr: '' } }
     if (argv[0] === 'ps') return { value: { exitCode: 0, stdout: mine + (!opts.cli ? '' : '  101 1 ttys003  claude --resume\n  102 1 ??  /Apps/claude\n  103 1 ttys004  vim\n'), stderr: '' } }
     if (argv[0] === 'perl')
@@ -75,11 +89,13 @@ function fakes(on: any, start: string, opts: { linearTeam?: string; agents?: unk
   on('session.id', async () => ({ value: 'this-thread' }))
   on('fs.list', async ($: unknown, e: any) => {
     const path = String(e.path ?? e)
+    if (opts.sharedFolder && path.endsWith('-tmp-billing'))
+      return { value: [{ name: 'new.jsonl', kind: 'file', size: 10, isLink: false }, { name: 'old.jsonl', kind: 'file', size: 10, isLink: false }] }
     if (opts.closed && path.endsWith('/.claude/projects')) return { value: [{ name: '-home-me-code-demo', kind: 'dir', size: 0, isLink: false }] }
     if (opts.closed && path.endsWith('-home-me-code-demo')) return { value: [{ name: 'old-id.jsonl', kind: 'file', size: 10, isLink: false }] }
     return { value: [{ name: 'abc.jsonl', kind: 'file', size: 10, isLink: false }] }
   })
-  on('fs.stat', async () => ({ value: { mtimeMs: 1, size: 10, kind: 'file' } }))
+  on('fs.stat', async ($: unknown, e: any) => ({ value: { mtimeMs: String(e.path ?? e).endsWith('new.jsonl') ? 2 : 1, size: 10, kind: 'file' } }))
   on('agent.list', async () => ({ value: opts.agents ?? [] }))
   on('session.usage', async () => ({ value: { startedAt: 0, context: { tokens: 0, window: 1, percent: 12 }, rateLimits: [], cost: { usd: 0.32 } } }))
   on('ui.open', async () => ({ value: { isPlaced: true } }))
@@ -476,5 +492,21 @@ test('after /reload-plugins, agent cards keep the model and steps saved for this
   const deck = await $.ui.mount({ plugin: 'workbench-bar', surface: 'desktop', ...PANE })
   expect(await deck.find({ type: 'Text', text: /^opus 5\.5$/ })).toBeDefined()
   expect(await deck.find({ type: 'Text', text: /3\/9/ })).toBeDefined()
+  await deck.unmount()
+})
+
+test('runs sharing a folder each get their own transcript, one card each, and HEAD gives way to the folder', async ($, on) => {
+  const saved: Record<string, unknown> = { 'spawned:this-thread': [{ id: '777', pid: '777', tty: '??', cwd: '', title: 'Terminal thread', isWorking: false, isClosed: true, at: 0 }] }
+  on('store.get', async ($: unknown, e: any) => ({ value: saved[e.key ?? e] }))
+  on('store.set', async () => ({ value: undefined }))
+  await started($, on, { sharedFolder: true })
+  const bar = await $.ui.mount({ plugin: 'workbench-bar', surface: 'desktop', ...BAND })
+  await bar.press({ key: 'agents' })
+  await bar.unmount()
+  const deck = await $.ui.mount({ plugin: 'workbench-bar', surface: 'desktop', ...PANE })
+  expect(((await deck.findAll({ type: 'Text', text: /Finish Server Projects/ })) as any[]).length).toBe(1)
+  expect(((await deck.findAll({ type: 'Text', text: /device unlock/ })) as any[]).length).toBe(1)
+  expect(await deck.find({ type: 'Text', text: /pid 902 · billing/ })).toBeDefined()
+  expect(await deck.find({ key: 'grp-agents:✕ Closed' })).toBeUndefined()
   await deck.unmount()
 })
