@@ -1481,8 +1481,12 @@ export const register: Register = (on, options) => {
         <Text key="gap1"> </Text>,
         <Text key="h-run" bold>{'▾ Running · ' + live.length}</Text>,
         ...(live.length ? live.map(card) : [empty('No subagents running.')]),
-        ...cliGroup('⤷ Started here', cliSpawned),
-        ...cliGroup('⌨ Terminal threads', [...cliThreads, ...cliClosed]),
+        ...cliGroup('⤷ Started here', cliSpawned.filter(c => !c.isClosed)),
+        ...cliGroup('⌨ Terminal threads', cliThreads),
+        ...cliGroup(
+          '✕ Closed',
+          [...cliSpawned.filter(c => c.isClosed), ...cliClosed.filter(c => !cliSpawned.some(x => x.id === c.id))].sort((a, b) => b.at - a.at),
+        ),
         ...(done.length ? [<Text key="gap2"> </Text>, <Text key="h-done" bold>{'▾ Finished · ' + done.length}</Text>, ...done.slice(-10).reverse().map(card)] : []),
       ]
     } else if (section === 'github') {

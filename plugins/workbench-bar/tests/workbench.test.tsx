@@ -418,6 +418,8 @@ test('closed CLI threads from the last 7 days show in the panel, but not in the 
   const deck = await $.ui.mount({ plugin: 'workbench-bar', surface: 'desktop', ...PANE })
   expect(await deck.find({ type: 'Text', text: /Write the release notes/ })).toBeDefined()
   expect(await deck.find({ type: 'Text', text: /claude -r old-id/ })).toBeDefined()
+  expect(await deck.find({ key: 'grp-agents:⌨ Terminal threads' })).toBeUndefined()
+  expect(((await deck.find({ key: 'grp-agents:✕ Closed' })) as any)?.props?.label).toBe('▾ ✕ Closed · 1')
   await deck.unmount()
 })
 
@@ -436,6 +438,8 @@ test('CLI threads this thread started show under Started here, and stay after th
   await bar.unmount()
   let deck = await $.ui.mount({ plugin: 'workbench-bar', surface: 'desktop', ...PANE })
   expect(await deck.find({ type: 'Text', text: /pid 902 · feat\/billing/ })).toBeDefined()
+  expect(((await deck.find({ key: 'grp-agents:⤷ Started here' })) as any)?.props?.label).toBe('▾ ⤷ Started here · 1')
+  expect(await deck.find({ key: 'grp-agents:✕ Closed' })).toBeUndefined()
   expect(await deck.find({ type: 'Text', text: /^opus 5\.5$/ })).toBeDefined()
   expect(await deck.find({ type: 'Text', text: /· high · 42 req · 1\.1M tok · ≈\$\d+\.\d\d · ctx 25%/ })).toBeDefined()
   expect(await deck.find({ type: 'Text', text: /▸ Bash/ })).toBeDefined()
@@ -445,6 +449,8 @@ test('CLI threads this thread started show under Started here, and stay after th
   deck = await $.ui.mount({ plugin: 'workbench-bar', surface: 'desktop', ...PANE })
   expect(await deck.find({ type: 'Text', text: /closed · feat\/billing.*claude -r abc/ })).toBeDefined()
   expect(await deck.find({ type: 'Text', text: /· high · 42 req/ })).toBeDefined()
+  expect(await deck.find({ key: 'grp-agents:⤷ Started here' })).toBeUndefined()
+  expect(((await deck.find({ key: 'grp-agents:✕ Closed' })) as any)?.props?.label).toBe('▾ ✕ Closed · 1')
   await deck.unmount()
 })
 
