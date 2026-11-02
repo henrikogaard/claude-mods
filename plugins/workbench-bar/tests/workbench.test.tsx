@@ -597,6 +597,12 @@ test('runs from Codex, OpenCode and Vibe in this repo get a group each, active o
   expect(await deck.find({ type: 'Text', text: /thread · feat\/api/ })).toBeDefined()
   expect(await deck.find({ type: 'Text', text: /gpt-6-astra · high · 2\.0M tok/ })).toBeDefined()
   expect(await deck.find({ type: 'Text', text: /gpt-6\.1-terra · 96.*\$0\.28/ })).toBeDefined()
+  // Each tool's own pixel icon, not a Clawd
+  const icons = ((await deck.findAll({ type: 'Svg' })) as any[]).map(x => x.props)
+  const iconOf = (name: string) => icons.find(x => x.alt === name + ' run')?.source
+  expect(iconOf('Codex')).toContain('#6d6ff2')
+  expect(iconOf('OpenCode')).toContain('#f4f4f4')
+  expect(iconOf('Vibe')).toContain('#fa500f')
   expect(await deck.find({ type: 'Text', text: /Another repo/ })).toBeUndefined()
   expect(await deck.find({ type: 'Text', text: /Elsewhere/ })).toBeUndefined()
   await deck.unmount()

@@ -1112,6 +1112,31 @@ function avatarSvg(model: string, isRunning: boolean): string {
   )
 }
 
+// Pixel icons for other agents, on the Clawd's 11 by 10 grid. A letter is a colour, a dot is empty
+const PROVIDER_ICONS: Record<string, { colours: Record<string, string>; rows: string[] }> = {
+  Codex: {
+    colours: { a: '#a5b4fc', b: '#6d6ff2', c: '#4f46e5', W: '#ffffff' },
+    rows: ['...aaaa....', '..aaaaaaaa.', '.aaaaaaaaa.', 'bbWbbbbbbbb', 'bbbWbbbbbbb', 'bbbbWbbbbbb', 'bbbWbbWWWbb', 'cbWbbbbbbbc', '.ccccccccc.', '..ccc.ccc..'],
+  },
+  OpenCode: {
+    colours: { k: '#1f1f1f', W: '#f4f4f4', g: '#6b6b6b' },
+    rows: ['kkkkkkkkkkk', 'kkWWWWWWWkk', 'kkWkkkkkWkk', 'kkWkkkkkWkk', 'kkWgggggWkk', 'kkWgggggWkk', 'kkWgggggWkk', 'kkWgggggWkk', 'kkWWWWWWWkk', 'kkkkkkkkkkk'],
+  },
+  Vibe: {
+    colours: { a: '#ffaf00', b: '#ff8205', c: '#fa500f', d: '#e10500' },
+    rows: ['aa.......aa', 'aaa.....aaa', 'bbbb...bbbb', 'bb.bb.bb.bb', 'bb..bbb..bb', 'cc...c...cc', 'cc.......cc', 'cc.......cc', 'dd.......dd', 'dd.......dd'],
+  },
+}
+
+function providerIconSvg(provider: string, isActive: boolean): string {
+  const icon = PROVIDER_ICONS[provider]
+  const bob = isActive ? "<animateTransform attributeName='transform' type='translate' values='0 0;0 -1;0 0' dur='0.5s' repeatCount='indefinite'/>" : ''
+  const rects = (icon?.rows ?? []).flatMap((row, y) =>
+    [...row].flatMap((c, x) => (icon?.colours[c] ? [`<rect x='${x * 2}' y='${y * 2}' width='2' height='2' fill='${icon.colours[c]}'/>`] : [])),
+  )
+  return `<svg xmlns='http://www.w3.org/2000/svg' width='22' height='20' viewBox='0 0 22 20' shape-rendering='crispEdges'><g opacity='${isActive ? 1 : 0.7}'>${bob}${rects.join('')}</g></svg>`
+}
+
 // A 4 px bar: filled to `fraction` in `colour`, with a light sweeping over it while running
 function barSvg(fraction: number, colour: string, isRunning: boolean, width = 260): string {
   const w = Math.round(Math.max(0, Math.min(1, fraction)) * width)
@@ -1645,7 +1670,7 @@ export const register: Register = (on, options) => {
           ...(isOpen('agents', name)
             ? list.map(r => (
                 <Box key={'run-' + name + r.id} flexDirection="row" columnGap={1} marginBottom={1}>
-                  {svg('run-av-' + r.id, avatarSvg(r.model || name, r.isActive), name + ' run', 22, 20, r.isActive)}
+                  {svg('run-av-' + r.id, providerIconSvg(name, r.isActive), name + ' run', 22, 20, r.isActive)}
                   <Box flexDirection="column" flexGrow={1}>
                     <Box flexDirection="row">
                       <Text bold wrap="truncate-end">{r.title}</Text>
