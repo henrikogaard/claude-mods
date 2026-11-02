@@ -104,13 +104,13 @@ async function refreshThreads($: EngineInterface) {
 type CliThread = { id: string; pid: string; tty: string; cwd: string; title: string; isWorking: boolean; isClosed: boolean; at: number; stats?: CliStats }
 // What a CLI thread's transcript says: its model, effort, branch, tokens (each request counted once),
 // the last request's context, and its last step (a tool, or the start of what it wrote)
-type CliStats = { model: string; effort: string; branch: string; usage: Usage; context: number; requests: number; tool: string; text: string }
+type CliStats = { model: string; effort: string; branch: string; usage: Usage; context: number; requests: number; tool: string; text: string; first?: string }
 let cliThreads: CliThread[] = []
 let cliClosed: CliThread[] = []
 let cliScannedAt = -Infinity
 const CLI_DAYS = 7
 
-const CLI_STATS_PL = "use JSON::PP; my $j = JSON::PP->new; my (%u, @ids, $model, $effort, $branch, $tool, $text, $ts);\nwhile (<>) {\n  next unless /\"type\":\"assistant\"/;\n  my $d = eval { $j->decode($_) } or next; my $m = $d->{message} or next;\n  $model = $m->{model} if $m->{model} && $m->{model} !~ /^</; $effort = $d->{effort} if $d->{effort}; $branch = $d->{gitBranch} if $d->{gitBranch}; $ts = $d->{timestamp};\n  for my $c (@{ $m->{content} || [] }) { if ($c->{type} eq 'tool_use') { $tool = $c->{name}; $text = '' } elsif ($c->{type} eq 'text' && $c->{text} =~ /\\S/) { ($text) = $c->{text} =~ /(\\S[^\\n]*)/; $tool = '' } }\n  push @ids, $m->{id} unless exists $u{ $m->{id} }; $u{ $m->{id} } = $m->{usage} || {};\n}\nmy %t = (input_tokens => 0, output_tokens => 0, cache_read_input_tokens => 0, cache_creation_input_tokens => 0);\nfor my $id (@ids) { $t{$_} += $u{$id}{$_} || 0 for keys %t }\nmy $l = @ids ? $u{ $ids[-1] } : {}; my $ctx = 0; $ctx += $l->{$_} || 0 for keys %t;\nprint $j->encode({ model => $model // '', effort => $effort // '', branch => $branch // '', usage => \\%t, context => $ctx, requests => scalar @ids, tool => $tool // '', text => substr($text // '', 0, 100), at => $ts // '' });"
+const CLI_STATS_PL = "use JSON::PP; my $j = JSON::PP->new; my (%u, @ids, $model, $effort, $branch, $tool, $text, $ts, $first);\nwhile (<>) {\n  next unless /\"type\":\"assistant\"/;\n  my $d = eval { $j->decode($_) } or next; my $m = $d->{message} or next;\n  $model = $m->{model} if $m->{model} && $m->{model} !~ /^</; $effort = $d->{effort} if $d->{effort}; $branch = $d->{gitBranch} if $d->{gitBranch}; $ts = $d->{timestamp}; $first //= $ts;\n  for my $c (@{ $m->{content} || [] }) { if ($c->{type} eq 'tool_use') { $tool = $c->{name}; $text = '' } elsif ($c->{type} eq 'text' && $c->{text} =~ /\\S/) { ($text) = $c->{text} =~ /(\\S[^\\n]*)/; $tool = '' } }\n  push @ids, $m->{id} unless exists $u{ $m->{id} }; $u{ $m->{id} } = $m->{usage} || {};\n}\nmy %t = (input_tokens => 0, output_tokens => 0, cache_read_input_tokens => 0, cache_creation_input_tokens => 0);\nfor my $id (@ids) { $t{$_} += $u{$id}{$_} || 0 for keys %t }\nmy $l = @ids ? $u{ $ids[-1] } : {}; my $ctx = 0; $ctx += $l->{$_} || 0 for keys %t;\nprint $j->encode({ model => $model // '', effort => $effort // '', branch => $branch // '', usage => \\%t, context => $ctx, requests => scalar @ids, tool => $tool // '', text => substr($text // '', 0, 100), at => $ts // '', first => $first // '' });"
 const cliStatsCache: Record<string, { at: number; stats: CliStats }> = {}
 
 // Read again only when the transcript has changed
@@ -133,10 +133,13 @@ async function transcriptHead($: EngineInterface, path: string) {
   return { title: text.trim() ? text.trim().split('\n')[0]!.slice(0, 80) : '', cwd: msg.cwd ?? '' }
 }
 
+// A folder's name under ~/.claude/projects: anything but a letter or digit becomes a dash
+const projectKey = (cwd: string) => cwd.replace(/[^a-zA-Z0-9]/g, '-')
+
 // Closed CLI threads: transcripts from the CLI (entrypoint "cli") in this repo's project folders
 async function scanClosedCli($: EngineInterface, repo: string, home: string, t: number, open: Set<string>) {
   const root = home + '/.claude/projects'
-  const dirs = (await $.fs.list(root)).filter(d => d.kind === 'dir' && d.name.includes('-' + repo.replace(/[/.]/g, '-')))
+  const dirs = (await $.fs.list(root)).filter(d => d.kind === 'dir' && d.name.includes('-' + projectKey(repo)))
   const recent: { path: string; at: number }[] = []
   for (const d of dirs) {
     for (const f of await $.fs.list(root + '/' + d.name)) {
@@ -176,10 +179,10 @@ async function cachedHead($: EngineInterface, path: string) {
   return head
 }
 
-// A process's transcript, in ~/.claude/projects/<cwd with / and . as ->. Runs can share a folder, so a
+// A process's transcript, in ~/.claude/projects/<projectKey of cwd>. Runs can share a folder, so a
 // prompt given on the command line must match the transcript's first message; else take the newest
 async function findTranscript($: EngineInterface, home: string, cwd: string, skip: string, args: string, claimed: Set<string>) {
-  const dir = home + '/.claude/projects/' + cwd.replace(/[/.]/g, '-')
+  const dir = home + '/.claude/projects/' + projectKey(cwd)
   const files: { path: string; at: number }[] = []
   try {
     for (const f of await $.fs.list(dir)) {
@@ -208,7 +211,7 @@ async function refreshCli($: EngineInterface) {
     .split('\n')
     .map(l => /^\s*(\d+)\s+(\d+)\s+(\S+)\s+(\S+)(.*)$/.exec(l))
     .filter((m): m is RegExpExecArray => Boolean(m))
-    .map(m => ({ pid: m[1] as string, ppid: m[2] as string, tty: m[3] as string, isClaude: /(^|\/)claude$|\/claude\/versions\/[^/]+$/.test(m[4] ?? ''), args: m[5] ?? '', isThisPs: /(^|\/)ps$/.test(m[4] ?? '') && (m[5] ?? '').includes('pid=,ppid=,tty=,command=') }))
+    .map(m => ({ pid: m[1] as string, ppid: m[2] as string, tty: m[3] as string, isClaude: /(^|\/)claude$|\/claude\/versions\/[^/]+$/.test(m[4] ?? ''), args: m[5] ?? '', isVibe: /(^|\/)vibe[^/]*$/.test(m[4] ?? ''), isThisPs: /(^|\/)ps$/.test(m[4] ?? '') && (m[5] ?? '').includes('pid=,ppid=,tty=,command=') }))
   // This thread's own process started the ps above, so it's that ps's parent
   selfPid = rows.find(r => r.isThisPs)?.ppid ?? selfPid
   const parent: Record<string, string> = {}
@@ -278,7 +281,7 @@ async function refreshCli($: EngineInterface) {
     let stats = c.stats
     let at = c.at
     if (c.cwd) {
-      const path = home + '/.claude/projects/' + c.cwd.replace(/[/.]/g, '-') + '/' + c.id + '.jsonl'
+      const path = home + '/.claude/projects/' + projectKey(c.cwd) + '/' + c.id + '.jsonl'
       try {
         at = Number(((await $.fs.stat(path)) as { mtimeMs?: number }).mtimeMs ?? 0) || at
         stats = (await cliStats($, path, at)) ?? stats
@@ -296,6 +299,125 @@ async function refreshCli($: EngineInterface) {
     } catch {}
   }
   cliThreads = found
+  // Other agents' data is read at most every 15 seconds
+  if (t - providersScannedAt > 15_000) {
+    providersScannedAt = t
+    await scanProviders($, home, repo, t, new Set(rows.filter(r => r.isVibe).map(r => r.pid))).catch(() => {})
+  }
+}
+
+// Runs of other coding agents in this same repo, from each tool's own local data, read-only
+type ProviderRun = { id: string; provider: string; title: string; cwd: string; branch: string; kind: string; model: string; effort: string; tokens: number; cost: number; at: number; isActive: boolean }
+let providerRuns: ProviderRun[] = []
+let providersScannedAt = -Infinity
+const PROVIDERS = ['Codex', 'OpenCode', 'Vibe']
+const PROVIDER_MAX = 10
+const firstLine = (text: unknown) => String(text ?? '').trim().split('\n')[0]!.slice(0, 80)
+const sqlText = (text: string) => "'" + text.replace(/'/g, "''") + "'"
+
+// A tool that isn't installed, or that changed its tables, answers with an error: then it has no runs
+async function sqliteRows($: EngineInterface, path: string, sql: string): Promise<Record<string, any>[]> {
+  const r = await $.process.run(['sqlite3', '-readonly', '-json', path, sql], { timeoutMs: 5_000 })
+  if (r.exitCode !== 0 || !r.stdout.trim()) return []
+  return JSON.parse(r.stdout) as Record<string, any>[]
+}
+
+// Codex has no live state for a thread, so one written to in the last 2 minutes counts as active
+async function codexRuns($: EngineInterface, home: string, repo: string, t: number): Promise<ProviderRun[]> {
+  const rows = await sqliteRows(
+    $,
+    home + '/.codex/state_5.sqlite',
+    "select id, source like '%thread_spawn%' as isSub, agent_nickname, agent_role, model, reasoning_effort, tokens_used, git_branch, cwd, updated_at_ms," +
+      " substr(coalesce(nullif(name,''),nullif(title,''),nullif(preview,''),first_user_message),1,200) as title from threads" +
+      ' where archived=0 and cwd like ' + sqlText('%' + repo + '%') + ' and updated_at_ms>' + (t - CLI_DAYS * 86_400_000) +
+      " and source not like '%guardian%' and (has_user_event=1 or source like '%thread_spawn%') order by updated_at_ms desc limit 100",
+  )
+  return rows
+    .filter(x => projectOf(String(x.cwd)) === repo)
+    .map(x => ({
+      id: String(x.id),
+      provider: 'Codex',
+      title: firstLine(x.title) || String(x.agent_nickname ?? 'Codex thread'),
+      cwd: String(x.cwd),
+      branch: String(x.git_branch ?? ''),
+      kind: x.isSub ? 'subagent' + (x.agent_role ? ' ' + x.agent_role : '') : 'thread',
+      model: String(x.model ?? ''),
+      effort: String(x.reasoning_effort ?? ''),
+      tokens: Number(x.tokens_used ?? 0),
+      cost: 0,
+      at: Number(x.updated_at_ms),
+      isActive: t - Number(x.updated_at_ms) < 120_000,
+    }))
+}
+
+// OpenCode notes when a session turns busy and idle; a busy one untouched for an hour was cut off
+async function openCodeRuns($: EngineInterface, home: string, repo: string, t: number): Promise<ProviderRun[]> {
+  const like = sqlText('%' + repo + '%')
+  const rows = await sqliteRows(
+    $,
+    home + '/.local/share/opencode/opencode.db',
+    'select s.id, s.parent_id is not null as isSub, s.agent, s.model, s.title, s.tokens_input+s.tokens_output+s.tokens_reasoning+s.tokens_cache_read+s.tokens_cache_write as tokens,' +
+      ' s.cost, s.directory, p.worktree, s.time_updated, s.time_busy, s.time_idle from session_v2 s left join project p on p.id=s.project_id' +
+      ' where s.time_archived is null and s.time_updated>' + (t - CLI_DAYS * 86_400_000) + ' and (s.directory like ' + like + ' or p.worktree like ' + like + ')' +
+      ' and (s.title is not null or s.tokens_input>0) order by s.time_updated desc limit 100',
+  )
+  return rows
+    .filter(x => projectOf(String(x.directory)) === repo || projectOf(String(x.worktree ?? '')) === repo)
+    .map(x => {
+      let model = ''
+      try {
+        model = String((JSON.parse(String(x.model)) as { id?: string }).id ?? '')
+      } catch {}
+      return {
+        id: String(x.id),
+        provider: 'OpenCode',
+        title: firstLine(x.title) || 'OpenCode session',
+        cwd: String(x.directory),
+        branch: '',
+        kind: (x.isSub ? 'subagent' : 'session') + (x.agent ? ' ' + x.agent : ''),
+        model,
+        effort: '',
+        tokens: Number(x.tokens ?? 0),
+        cost: Number(x.cost ?? 0),
+        at: Number(x.time_updated),
+        isActive: Number(x.time_busy ?? 0) > Number(x.time_idle ?? 0) && t - Number(x.time_updated) < 3_600_000,
+      }
+    })
+}
+
+// Vibe keeps a folder per session, and a lock file naming the process of each open one. Locks
+// outlive their process, and its number can be reused, so the process must still be Vibe's
+async function vibeRuns($: EngineInterface, home: string, repo: string, t: number, pids: Set<string>): Promise<ProviderRun[]> {
+  const root = home + '/.vibe/logs/session'
+  const open = new Set<string>()
+  for (const f of await $.fs.list(root + '/active').catch(() => [])) {
+    if (!/\.lock(\.json)?$/.test(f.name)) continue
+    try {
+      const lock = JSON.parse((await $.fs.read(root + '/active/' + f.name)) as string) as { process_id?: number; session_id?: string }
+      if (lock.session_id && pids.has(String(lock.process_id))) open.add(lock.session_id)
+    } catch {}
+  }
+  const runs: ProviderRun[] = []
+  for (const d of await $.fs.list(root + '/unified').catch(() => [])) {
+    if (d.kind !== 'dir') continue
+    try {
+      const path = root + '/unified/' + d.name + '/meta.json'
+      const at = Number(((await $.fs.stat(path)) as { mtimeMs?: number }).mtimeMs ?? 0)
+      if (t - at >= CLI_DAYS * 86_400_000 && !open.has(d.name)) continue
+      const meta = JSON.parse((await $.fs.read(path)) as string) as { title?: string | null; parent_session_id?: string | null; git_branch?: string | null; origin_directory?: string; archived_at?: string | null; config?: { active_model?: string } }
+      const cwd = meta.origin_directory ?? ''
+      if (meta.archived_at || projectOf(cwd) !== repo) continue
+      runs.push({ id: d.name, provider: 'Vibe', title: firstLine(meta.title) || 'Vibe session', cwd, branch: meta.git_branch ?? '', kind: meta.parent_session_id ? 'subagent' : 'session', model: meta.config?.active_model ?? '', effort: '', tokens: 0, cost: 0, at, isActive: open.has(d.name) })
+    } catch {}
+  }
+  return runs
+}
+
+async function scanProviders($: EngineInterface, home: string, repo: string, t: number, pids: Set<string>) {
+  const found = await Promise.allSettled([codexRuns($, home, repo, t), openCodeRuns($, home, repo, t), vibeRuns($, home, repo, t, pids)])
+  const runs = found.flatMap(r => (r.status === 'fulfilled' ? r.value : []))
+  runs.sort((a, b) => Number(b.isActive) - Number(a.isActive) || b.at - a.at)
+  providerRuns = PROVIDERS.flatMap(p => runs.filter(r => r.provider === p).slice(0, PROVIDER_MAX))
 }
 
 // PRs where someone asked you for a review
@@ -475,32 +597,88 @@ let agentsSavedAt = 0
 async function loadAgentInfo($: EngineInterface) {
   agentsLoaded = true
   const saved = (await $.store.get('agents:' + (await $.session.id())).catch(() => undefined)) as
-    | { models?: Record<string, string>; use?: Record<string, AgentUse>; starts?: Record<string, number> }
+    | { models?: Record<string, string>; use?: Record<string, AgentUse>; starts?: Record<string, number>; ends?: Record<string, number> }
     | undefined
   for (const [id, m] of Object.entries(saved?.models ?? {})) models[id] ??= m
   for (const [id, u] of Object.entries(saved?.use ?? {})) agentUse[id] ??= u
   for (const [id, at] of Object.entries(saved?.starts ?? {})) agentStarts[id] ??= at
+  for (const [id, at] of Object.entries(saved?.ends ?? {})) agentEnds[id] ??= at
 }
 
 async function saveAgentInfo($: EngineInterface, isNow = false) {
   const t = await $.clock.now()
   if (!isNow && t - agentsSavedAt < 10_000) return
   agentsSavedAt = t
-  await $.store.set('agents:' + (await $.session.id()), { models, use: agentUse, starts: agentStarts }).catch(() => {})
+  await $.store.set('agents:' + (await $.session.id()), { models, use: agentUse, starts: agentStarts, ends: agentEnds }).catch(() => {})
+}
+
+// Each subagent's own files say if it finished, when, and on which model. That also covers agents
+// the mod didn't watch, and ones the app still lists as running
+const agentsSettled = new Set<string>()
+const AGENT_QUIET_MS = 10 * 60_000
+
+async function agentFile($: EngineInterface, dir: string, id: string) {
+  const path = dir + '/agent-' + id
+  const at = Number(((await $.fs.stat(path + '.jsonl')) as { mtimeMs?: number }).mtimeMs ?? 0)
+  const meta = JSON.parse((await $.fs.read(path + '.meta.json')) as string) as { finished?: boolean }
+  return { path: path + '.jsonl', at, isFinished: Boolean(meta.finished) }
+}
+
+// Returns the agents the app lists as running that have finished
+async function readAgentFiles($: EngineInterface, list: { id: string; status: string }[], t: number) {
+  const stale = new Set<string>()
+  const home = (await $.env.get('HOME')) ?? ''
+  const dir = home + '/.claude/projects/' + projectKey(await $.session.root()) + '/' + (await $.session.id()) + '/subagents'
+  let isChanged = false
+  for (const a of list) {
+    const isLive = LIVE.includes(a.status)
+    if (agentsSettled.has(a.id) && !isLive) continue
+    const file = await agentFile($, dir, a.id).catch(() => undefined)
+    if (!file) continue
+    // A finished agent can be resumed and then sit in a long tool call, so give it plenty of quiet time
+    const isStale = isLive && file.isFinished && t - file.at > AGENT_QUIET_MS
+    if (isStale) stale.add(a.id)
+    const isDone = isStale || (!isLive && (a.status !== 'idle' || file.isFinished))
+    if ((isDone && !agentsSettled.has(a.id)) || !/\d/.test(models[a.id] ?? '')) {
+      const st = await cliStats($, file.path, file.at).catch(() => undefined)
+      if (st?.model && models[a.id] !== st.model) {
+        models[a.id] = st.model
+        isChanged = true
+      }
+      const first = Date.parse(st?.first ?? '')
+      if (first > 0) agentStarts[a.id] = first
+      if (st && isDone && !agentUse[a.id]?.tokens) {
+        const tokens = (st.usage.input_tokens ?? 0) + (st.usage.output_tokens ?? 0) + (st.usage.cache_read_input_tokens ?? 0) + (st.usage.cache_creation_input_tokens ?? 0)
+        agentUse[a.id] = { ...agentUse[a.id], context: st.context, window: windowOf(st.model), tokens, cost: costOf(st.model, st.usage), effort: st.effort || undefined }
+      }
+    }
+    if (isDone) {
+      if (!agentsSettled.has(a.id)) isChanged = true
+      agentEnds[a.id] = file.at
+      agentsSettled.add(a.id)
+    } else if (isLive) {
+      agentsSettled.delete(a.id)
+      delete agentEnds[a.id]
+    }
+  }
+  if (isChanged) await saveAgentInfo($, true).catch(() => {})
+  return stale
 }
 
 async function refreshAgents($: EngineInterface) {
   if (!agentsLoaded) await loadAgentInfo($).catch(() => {})
   const list = await $.agent.list()
   const t = await $.clock.now()
+  const stale = await readAgentFiles($, list, t).catch(() => new Set<string>())
   allAgents = list.map(a => {
+    const status = stale.has(a.id) ? 'completed' : a.status
     const startedAt = (agentStarts[a.id] ??= t)
-    if (!LIVE.includes(a.status) && a.status !== 'idle' && agentEnds[a.id] === undefined) agentEnds[a.id] = t
+    if (!LIVE.includes(status) && status !== 'idle' && agentEnds[a.id] === undefined) agentEnds[a.id] = t
     return {
       id: a.id,
       name: a.name ?? a.teammateId ?? a.description,
       type: a.type,
-      status: a.status,
+      status,
       model: models[a.id] ?? (a.teammateId ? models[a.teammateId] : undefined) ?? '?',
       startedAt,
       endedAt: agentEnds[a.id],
@@ -1287,7 +1465,7 @@ export const register: Register = (on, options) => {
         </Box>
       )
     }
-    const cliOpen = cliThreads.length + cliSpawned.filter(c => !c.isClosed).length
+    const cliOpen = cliThreads.length + cliSpawned.filter(c => !c.isClosed).length + providerRuns.filter(r => r.isActive).length
     const row = (
       <Box key="workbench-row" flexDirection="row" columnGap={3}>
         {(els as any).Svg({ key: 'clawd', source: clawdSvg(now < partyUntil ? 'party' : activity), alt: 'Clawd ' + (now < partyUntil ? 'party' : activity), isInteractive: true, width: 36, height: 18 })}
@@ -1458,6 +1636,34 @@ export const register: Register = (on, options) => {
                 : []),
             ]
           : []
+      const providerGroup = (name: string) => {
+        const list = providerRuns.filter(r => r.provider === name)
+        if (list.length === 0) return []
+        return [
+          <Text key={'gap-' + name}> </Text>,
+          group('agents', name, list.length),
+          ...(isOpen('agents', name)
+            ? list.map(r => (
+                <Box key={'run-' + name + r.id} flexDirection="row" columnGap={1} marginBottom={1}>
+                  {svg('run-av-' + r.id, avatarSvg(r.model || name, r.isActive), name + ' run', 22, 20, r.isActive)}
+                  <Box flexDirection="column" flexGrow={1}>
+                    <Box flexDirection="row">
+                      <Text bold wrap="truncate-end">{r.title}</Text>
+                      <Box flexGrow={1} />
+                      <Text color={r.isActive ? GREEN : dim}>{r.isActive ? '●' : '○'}</Text>
+                    </Box>
+                    <Text color={dim} wrap="truncate-end">
+                      {r.kind + ' · ' + (r.branch && r.branch !== 'HEAD' ? r.branch : (r.cwd.split('/').pop() ?? '')) + ' · ' + ago(new Date(r.at).toISOString())}
+                    </Text>
+                    <Text color={dim} wrap="truncate-end">
+                      {[r.model, r.effort, r.tokens ? fmtTokens(r.tokens) + ' tok' : '', r.cost ? '$' + r.cost.toFixed(2) : ''].filter(Boolean).join(' · ')}
+                    </Text>
+                  </Box>
+                </Box>
+              ))
+            : []),
+        ]
+      }
       const card = (a: AgentRow) => {
         const u = agentUse[a.id]
         const isLive = LIVE.includes(a.status)
@@ -1506,6 +1712,7 @@ export const register: Register = (on, options) => {
           '✕ Closed',
           [...cliSpawned.filter(c => c.isClosed), ...cliClosed.filter(c => !cliSpawned.some(x => x.id === c.id))].sort((a, b) => b.at - a.at),
         ),
+        ...PROVIDERS.flatMap(providerGroup),
         ...(done.length ? [<Text key="gap2"> </Text>, <Text key="h-done" bold>{'▾ Finished · ' + done.length}</Text>, ...done.slice(-10).reverse().map(card)] : []),
       ]
     } else if (section === 'github') {
