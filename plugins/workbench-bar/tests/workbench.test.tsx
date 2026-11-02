@@ -4,7 +4,7 @@ import { modelLabel } from '../hooks/register'
 const BAND = { component: 'AbovePrompt', props: { hasSurvey: false, isWorking: false, maxRows: 5, bodyColumns: 140 } as any } as const
 
 // Fakes for the desktop app's sidebar, Linear, gh and the session
-function fakes(on: any, start: string, opts: { linearTeam?: string; agents?: unknown[]; branch?: string; calls?: string[]; cli?: boolean; closed?: boolean; spawned?: { live: boolean }; sharedFolder?: boolean } = {}) {
+function fakes(on: any, start: string, opts: { linearTeam?: string; agents?: unknown[]; branch?: string; calls?: string[]; cli?: boolean; closed?: boolean; spawned?: { live: boolean }; sharedFolder?: boolean; sqlite?: Record<string, unknown[]>; files?: Record<string, string> } = {}) {
   const state = { groupBy: start, sortBy: 'created' }
   on('mcp.call', async ($: unknown, e: { server: string; tool: string; args: Record<string, unknown> }) => {
     const ok = (data: unknown) => ({ value: { isError: false, content: [{ type: 'text', text: JSON.stringify(data) }] } })
@@ -35,9 +35,15 @@ function fakes(on: any, start: string, opts: { linearTeam?: string; agents?: unk
   on('process.run', async ($: unknown, e: any) => {
     const argv = (Array.isArray(e) ? e : (e.argv ?? e.args ?? [])) as string[]
     opts.calls?.push(argv.join(' '))
+    if (argv[0] === 'perl' && String(argv[3]).endsWith('agent-a1.jsonl'))
+      return { value: { exitCode: 0, stderr: '', stdout: JSON.stringify({ model: 'claude-sonnet-5-5', effort: '', branch: '', usage: { output_tokens: 5000 }, context: 5000, requests: 3, tool: '', text: '', first: '1970-01-01T00:00:00.000Z' }) } }
+    if (argv[0] === 'sqlite3') {
+      const rows = Object.entries(opts.sqlite ?? {}).find(([db]) => String(argv[3]).endsWith(db))?.[1]
+      return rows ? { value: { exitCode: 0, stdout: JSON.stringify(rows), stderr: '' } } : { value: { exitCode: 1, stdout: '', stderr: 'unable to open database' } }
+    }
     // Two claude processes: one in a terminal in this repo, one the desktop app's (no terminal)
     // This thread is 900 (the parent of the ps it runs); a background shell (901) started `claude -p` (902)
-    const mine = '  900 1 ??  /Apps/claude\n  950 900 ??  ps -axo pid=,ppid=,tty=,command=\n' + (opts.spawned?.live ? '  901 1 ??  /bin/sh\n  902 901 ??  claude -p hi\n' : '')
+    const mine = '  900 1 ??  /Apps/claude\n  950 900 ??  ps -axo pid=,ppid=,tty=,command=\n' + (opts.spawned?.live ? '  901 1 ??  /bin/sh\n  902 901 ??  claude -p hi\n' : '') + (opts.files ? '  960 1 ??  vibe-app-server\n' : '')
     // A background command is cut loose (its shell's parent is 1), but the env names the thread
     // Two runs in one folder: the first was started before the newer transcript's run
     if (opts.sharedFolder && argv[0] === 'ps' && argv[1] === 'eww') return { value: { exitCode: 0, stdout: '  902 x CLAUDE_PID=900\n  903 x CLAUDE_PID=900\n', stderr: '' } }
@@ -89,6 +95,8 @@ function fakes(on: any, start: string, opts: { linearTeam?: string; agents?: unk
   on('session.id', async () => ({ value: 'this-thread' }))
   on('fs.list', async ($: unknown, e: any) => {
     const path = String(e.path ?? e)
+    if (path.endsWith('/.vibe/logs/session/active')) return { value: opts.files ? [{ name: 'v1.lock', kind: 'file', size: 10, isLink: false }, { name: 'v3.lock.json', kind: 'file', size: 10, isLink: false }] : [] }
+    if (path.endsWith('/.vibe/logs/session/unified')) return { value: opts.files ? ['v1', 'v2', 'v3'].map(name => ({ name, kind: 'dir', size: 0, isLink: false })) : [] }
     if (opts.sharedFolder && path.endsWith('-tmp-billing'))
       return { value: [{ name: 'new.jsonl', kind: 'file', size: 10, isLink: false }, { name: 'old.jsonl', kind: 'file', size: 10, isLink: false }] }
     if (opts.closed && path.endsWith('/.claude/projects')) return { value: [{ name: '-home-me-code-demo', kind: 'dir', size: 0, isLink: false }] }
@@ -96,6 +104,11 @@ function fakes(on: any, start: string, opts: { linearTeam?: string; agents?: unk
     return { value: [{ name: 'abc.jsonl', kind: 'file', size: 10, isLink: false }] }
   })
   on('fs.stat', async ($: unknown, e: any) => ({ value: { mtimeMs: String(e.path ?? e).endsWith('new.jsonl') ? 2 : 1, size: 10, kind: 'file' } }))
+  on('fs.read', async ($: unknown, e: any) => {
+    const hit = Object.entries(opts.files ?? {}).find(([name]) => String(e.path ?? e).endsWith(name))
+    if (!hit) throw new Error('no such file')
+    return { value: hit[1] }
+  })
   on('agent.list', async () => ({ value: opts.agents ?? [] }))
   on('session.usage', async () => ({ value: { startedAt: 0, context: { tokens: 0, window: 1, percent: 12 }, rateLimits: [], cost: { usd: 0.32 } } }))
   on('ui.open', async () => ({ value: { isPlaced: true } }))
@@ -522,5 +535,87 @@ test('a closed run saved twice shows once', async ($, on) => {
   await bar.unmount()
   const deck = await $.ui.mount({ plugin: 'workbench-bar', surface: 'desktop', ...PANE })
   expect(((await deck.findAll({ type: 'Text', text: /Saved twice/ })) as any[]).length).toBe(1)
+  await deck.unmount()
+})
+
+test('a finished agent the app still lists as running moves to Finished, with its model and real time', async ($, on) => {
+  const saved: Record<string, any> = {}
+  on('store.get', async ($: unknown, e: any) => ({ value: saved[e.key ?? e] }))
+  on('store.set', async ($: unknown, e: any) => {
+    saved[e.key] = e.value
+    return { value: undefined }
+  })
+  const clock = mock.clock(on)
+  fakes(on, 'state', { agents: [{ id: 'a1', description: 'Old work', type: 'general-purpose', status: 'running' }], files: { 'agent-a1.meta.json': JSON.stringify({ finished: true }) } })
+  await ($ as any).session.start({ cwd: '/home/me/code/demo', surface: 'desktop' })
+  await clock.advance(11 * 60_000)
+  const bar = await $.ui.mount({ plugin: 'workbench-bar', surface: 'desktop', ...BAND })
+  await bar.press({ key: 'agents' })
+  await bar.unmount()
+  const deck = await $.ui.mount({ plugin: 'workbench-bar', surface: 'desktop', ...PANE })
+  expect(await deck.find({ type: 'Text', text: /Finished · 1/ })).toBeDefined()
+  expect(await deck.find({ type: 'Text', text: /Running · 0/ })).toBeDefined()
+  expect(await deck.find({ type: 'Text', text: /^sonnet 5\.5$/ })).toBeDefined()
+  expect(await deck.find({ type: 'Text', text: /5k.*≈\$\d+\.\d\d/ })).toBeDefined()
+  expect(saved['agents:this-thread'].ends.a1).toBe(1)
+  await deck.unmount()
+})
+
+test('runs from Codex, OpenCode and Vibe in this repo split into running and finished, by provider', async ($, on) => {
+  const at = 200_000
+  const clock = mock.clock(on)
+  fakes(on, 'state', {
+    cli: false,
+    sqlite: {
+      'state_5.sqlite': [
+        { id: 'c1', isSub: 0, model: 'gpt-6-astra', reasoning_effort: 'high', tokens_used: 2_000_000, git_branch: 'feat/api', cwd: '/home/me/code/demo', updated_at_ms: 1, title: 'Old API work' },
+        { id: 'c2', isSub: 1, agent_nickname: 'Boole', agent_role: 'worker', model: 'gpt-6-astra', tokens_used: 1000, cwd: '/home/me/.codex/worktrees/ab/demo', updated_at_ms: at, title: '' },
+        { id: 'c3', isSub: 0, model: 'x', tokens_used: 1, cwd: '/home/me/code/demo-other', updated_at_ms: at, title: 'Another repo' },
+      ],
+      'opencode.db': [{ id: 'o1', isSub: 0, agent: 'build', model: '{"id":"gpt-6.1-terra","providerID":"openai"}', title: 'Busy session', tokens: 96000, cost: 0.28, directory: '/x/opencode/worktree/ab/calm', worktree: '/home/me/code/demo', time_updated: at, time_busy: 2, time_idle: 1 }],
+    },
+    files: {
+      'v1.lock': JSON.stringify({ process_id: 960, session_id: 'v1' }),
+      // Its process number now belongs to something else
+      'v3.lock.json': JSON.stringify({ process_id: 900, session_id: 'v3' }),
+      'v3/meta.json': JSON.stringify({ title: 'Old vibe', origin_directory: '/home/me/code/demo' }),
+      'v1/meta.json': JSON.stringify({ title: 'Vibe fix', origin_directory: '/home/me/code/demo', config: { active_model: 'mistral-large-4-0-3' } }),
+      'v2/meta.json': JSON.stringify({ title: 'Elsewhere', origin_directory: '/home/me/code/tools' }),
+    },
+  })
+  await ($ as any).session.start({ cwd: '/home/me/code/demo', surface: 'desktop' })
+  await clock.advance(at)
+  const bar = await $.ui.mount({ plugin: 'workbench-bar', surface: 'desktop', ...BAND })
+  expect(((await bar.find({ key: 'agents' })) as any)?.props?.label).toBe('0 +3 ⌨')
+  await bar.press({ key: 'agents' })
+  await bar.unmount()
+  const deck = await $.ui.mount({ plugin: 'workbench-bar', surface: 'desktop', ...PANE })
+  expect(((await deck.find({ key: 'grp-agents:Other running agents' })) as any)?.props?.label).toBe('▾ Other running agents · 3')
+  expect(((await deck.find({ key: 'grp-agents:Other finished agents' })) as any)?.props?.label).toBe('▾ Other finished agents · 2')
+  // Running first, and in provider order inside each group
+  const order = ((await deck.findAll({ type: 'Svg' })) as any[]).map(x => String(x.props.alt)).filter(alt => alt.endsWith(' run'))
+  expect(order).toEqual(['Codex run', 'OpenCode run', 'Vibe run', 'Codex run', 'Vibe run'])
+  expect(await deck.find({ type: 'Text', text: /Codex · subagent worker · demo/ })).toBeDefined()
+  expect(await deck.find({ type: 'Text', text: /Codex · thread · feat\/api/ })).toBeDefined()
+  expect(await deck.find({ type: 'Text', text: /gpt-6-astra · high · 2\.0M tok/ })).toBeDefined()
+  expect(await deck.find({ type: 'Text', text: /gpt-6\.1-terra · 96.*\$0\.28/ })).toBeDefined()
+  // Each tool's own pixel icon, not a Clawd
+  const icons = ((await deck.findAll({ type: 'Svg' })) as any[]).map(x => x.props)
+  const iconOf = (name: string) => icons.find(x => x.alt === name + ' run')?.source
+  expect(iconOf('Codex')).toContain('#6d6ff2')
+  expect(iconOf('OpenCode')).toContain('#f4f4f4')
+  expect(iconOf('Vibe')).toContain('#fa500f')
+  expect(await deck.find({ type: 'Text', text: /Another repo/ })).toBeUndefined()
+  expect(await deck.find({ type: 'Text', text: /Elsewhere/ })).toBeUndefined()
+  await deck.unmount()
+})
+
+test('tools that are not installed add no groups', async ($, on) => {
+  await started($, on)
+  const bar = await $.ui.mount({ plugin: 'workbench-bar', surface: 'desktop', ...BAND })
+  await bar.press({ key: 'agents' })
+  await bar.unmount()
+  const deck = await $.ui.mount({ plugin: 'workbench-bar', surface: 'desktop', ...PANE })
+  for (const name of ['Other running agents', 'Other finished agents']) expect(await deck.find({ key: 'grp-agents:' + name })).toBeUndefined()
   await deck.unmount()
 })
