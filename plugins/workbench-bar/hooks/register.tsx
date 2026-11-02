@@ -417,6 +417,7 @@ async function scanProviders($: EngineInterface, home: string, repo: string, t: 
   const found = await Promise.allSettled([codexRuns($, home, repo, t), openCodeRuns($, home, repo, t), vibeRuns($, home, repo, t, pids)])
   const runs = found.flatMap(r => (r.status === 'fulfilled' ? r.value : []))
   runs.sort((a, b) => Number(b.isActive) - Number(a.isActive) || b.at - a.at)
+  // In provider order; the panel splits them into running and finished
   providerRuns = PROVIDERS.flatMap(p => runs.filter(r => r.provider === p).slice(0, PROVIDER_MAX))
 }
 
@@ -1661,16 +1662,15 @@ export const register: Register = (on, options) => {
                 : []),
             ]
           : []
-      const providerGroup = (name: string) => {
-        const list = providerRuns.filter(r => r.provider === name)
+      const runGroup = (name: string, list: ProviderRun[]) => {
         if (list.length === 0) return []
         return [
           <Text key={'gap-' + name}> </Text>,
           group('agents', name, list.length),
           ...(isOpen('agents', name)
             ? list.map(r => (
-                <Box key={'run-' + name + r.id} flexDirection="row" columnGap={1} marginBottom={1}>
-                  {svg('run-av-' + r.id, providerIconSvg(name, r.isActive), name + ' run', 22, 20, r.isActive)}
+                <Box key={'run-' + r.provider + r.id} flexDirection="row" columnGap={1} marginBottom={1}>
+                  {svg('run-av-' + r.id, providerIconSvg(r.provider, r.isActive), r.provider + ' run', 22, 20, r.isActive)}
                   <Box flexDirection="column" flexGrow={1}>
                     <Box flexDirection="row">
                       <Text bold wrap="truncate-end">{r.title}</Text>
@@ -1678,7 +1678,7 @@ export const register: Register = (on, options) => {
                       <Text color={r.isActive ? GREEN : dim}>{r.isActive ? '●' : '○'}</Text>
                     </Box>
                     <Text color={dim} wrap="truncate-end">
-                      {r.kind + ' · ' + (r.branch && r.branch !== 'HEAD' ? r.branch : (r.cwd.split('/').pop() ?? '')) + ' · ' + ago(new Date(r.at).toISOString())}
+                      {r.provider + ' · ' + r.kind + ' · ' + (r.branch && r.branch !== 'HEAD' ? r.branch : (r.cwd.split('/').pop() ?? '')) + ' · ' + ago(new Date(r.at).toISOString())}
                     </Text>
                     <Text color={dim} wrap="truncate-end">
                       {[r.model, r.effort, r.tokens ? fmtTokens(r.tokens) + ' tok' : '', r.cost ? '$' + r.cost.toFixed(2) : ''].filter(Boolean).join(' · ')}
@@ -1737,7 +1737,8 @@ export const register: Register = (on, options) => {
           '✕ Closed',
           [...cliSpawned.filter(c => c.isClosed), ...cliClosed.filter(c => !cliSpawned.some(x => x.id === c.id))].sort((a, b) => b.at - a.at),
         ),
-        ...PROVIDERS.flatMap(providerGroup),
+        ...runGroup('Other running agents', providerRuns.filter(r => r.isActive)),
+        ...runGroup('Other finished agents', providerRuns.filter(r => !r.isActive)),
         ...(done.length ? [<Text key="gap2"> </Text>, <Text key="h-done" bold>{'▾ Finished · ' + done.length}</Text>, ...done.slice(-10).reverse().map(card)] : []),
       ]
     } else if (section === 'github') {

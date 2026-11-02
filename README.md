@@ -47,7 +47,7 @@ A new thread opens with a few seconds of falling orange letters. In a terminal t
 **The details panel** opens when you click an item. ⟳ (or `r`) fetches everything again.
 
 - **Git:** branch, the delivery checklist (Implemented locally → Pushed → Ready for review → Merge-ready → Merged) with the next step, the PR's checks, 🛠 **Fix CI** and ↻ **re-run** a failed check.
-- **Agents:** cost, today's cost across threads, agent tokens and time; a card per subagent with a Clawd in a hat by model, steps or context fill, tokens, estimated cost and time. Runs from Codex, OpenCode and Mistral Vibe in the same repo from the last 7 days get a group each, read from those tools' local data.
+- **Agents:** cost, today's cost across threads, agent tokens and time; a card per subagent with a Clawd in a hat by model, steps or context fill, tokens, estimated cost and time. Runs from Codex, OpenCode and Mistral Vibe in the same repo from the last 7 days are listed under other running and other finished agents, by provider, read from those tools' local data.
 
   ![Agent cards](docs/av.png)
 - **GitHub:** review requests, PRs (author, branch, +/−, files, review state, CI) and issues (labels, comments, age), in foldable groups.

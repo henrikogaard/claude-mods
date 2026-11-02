@@ -561,7 +561,7 @@ test('a finished agent the app still lists as running moves to Finished, with it
   await deck.unmount()
 })
 
-test('runs from Codex, OpenCode and Vibe in this repo get a group each, active ones first', async ($, on) => {
+test('runs from Codex, OpenCode and Vibe in this repo split into running and finished, by provider', async ($, on) => {
   const at = 200_000
   const clock = mock.clock(on)
   fakes(on, 'state', {
@@ -590,11 +590,13 @@ test('runs from Codex, OpenCode and Vibe in this repo get a group each, active o
   await bar.press({ key: 'agents' })
   await bar.unmount()
   const deck = await $.ui.mount({ plugin: 'workbench-bar', surface: 'desktop', ...PANE })
-  expect(((await deck.find({ key: 'grp-agents:Codex' })) as any)?.props?.label).toBe('▾ Codex · 2')
-  expect(((await deck.find({ key: 'grp-agents:OpenCode' })) as any)?.props?.label).toBe('▾ OpenCode · 1')
-  expect(((await deck.find({ key: 'grp-agents:Vibe' })) as any)?.props?.label).toBe('▾ Vibe · 2')
-  expect(await deck.find({ type: 'Text', text: /subagent worker · demo/ })).toBeDefined()
-  expect(await deck.find({ type: 'Text', text: /thread · feat\/api/ })).toBeDefined()
+  expect(((await deck.find({ key: 'grp-agents:Other running agents' })) as any)?.props?.label).toBe('▾ Other running agents · 3')
+  expect(((await deck.find({ key: 'grp-agents:Other finished agents' })) as any)?.props?.label).toBe('▾ Other finished agents · 2')
+  // Running first, and in provider order inside each group
+  const order = ((await deck.findAll({ type: 'Svg' })) as any[]).map(x => String(x.props.alt)).filter(alt => alt.endsWith(' run'))
+  expect(order).toEqual(['Codex run', 'OpenCode run', 'Vibe run', 'Codex run', 'Vibe run'])
+  expect(await deck.find({ type: 'Text', text: /Codex · subagent worker · demo/ })).toBeDefined()
+  expect(await deck.find({ type: 'Text', text: /Codex · thread · feat\/api/ })).toBeDefined()
   expect(await deck.find({ type: 'Text', text: /gpt-6-astra · high · 2\.0M tok/ })).toBeDefined()
   expect(await deck.find({ type: 'Text', text: /gpt-6\.1-terra · 96.*\$0\.28/ })).toBeDefined()
   // Each tool's own pixel icon, not a Clawd
@@ -608,12 +610,12 @@ test('runs from Codex, OpenCode and Vibe in this repo get a group each, active o
   await deck.unmount()
 })
 
-test('a tool that is not installed adds no group', async ($, on) => {
+test('tools that are not installed add no groups', async ($, on) => {
   await started($, on)
   const bar = await $.ui.mount({ plugin: 'workbench-bar', surface: 'desktop', ...BAND })
   await bar.press({ key: 'agents' })
   await bar.unmount()
   const deck = await $.ui.mount({ plugin: 'workbench-bar', surface: 'desktop', ...PANE })
-  for (const name of ['Codex', 'OpenCode', 'Vibe']) expect(await deck.find({ key: 'grp-agents:' + name })).toBeUndefined()
+  for (const name of ['Other running agents', 'Other finished agents']) expect(await deck.find({ key: 'grp-agents:' + name })).toBeUndefined()
   await deck.unmount()
 })
