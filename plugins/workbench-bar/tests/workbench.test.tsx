@@ -4,7 +4,7 @@ import { modelLabel } from '../hooks/register'
 const BAND = { component: 'AbovePrompt', props: { hasSurvey: false, isWorking: false, maxRows: 5, bodyColumns: 140 } as any } as const
 
 // Fakes for the desktop app's sidebar, Linear, gh and the session
-function fakes(on: any, start: string, opts: { linearTeam?: string; agents?: unknown[]; branch?: string; calls?: string[]; cli?: boolean; closed?: boolean; spawned?: { live: boolean }; sharedFolder?: boolean; sqlite?: Record<string, unknown[]>; files?: Record<string, string> } = {}) {
+function fakes(on: any, start: string, opts: { linearTeam?: string; agents?: unknown[]; branch?: string; calls?: string[]; cli?: boolean; closed?: boolean; spawned?: { live: boolean }; sharedFolder?: boolean; sqlite?: Record<string, unknown[]>; files?: Record<string, string>; plan?: string } = {}) {
   const state = { groupBy: start, sortBy: 'created' }
   on('mcp.call', async ($: unknown, e: { server: string; tool: string; args: Record<string, unknown> }) => {
     const ok = (data: unknown) => ({ value: { isError: false, content: [{ type: 'text', text: JSON.stringify(data) }] } })
@@ -105,6 +105,7 @@ function fakes(on: any, start: string, opts: { linearTeam?: string; agents?: unk
   })
   on('fs.stat', async ($: unknown, e: any) => ({ value: { mtimeMs: String(e.path ?? e).endsWith('new.jsonl') ? 2 : 1, size: 10, kind: 'file' } }))
   on('fs.read', async ($: unknown, e: any) => {
+    if (opts.plan && String(e.path ?? e).endsWith('/.claude.json')) return { value: JSON.stringify({ oauthAccount: { planDisplayName: opts.plan } }) }
     const hit = Object.entries(opts.files ?? {}).find(([name]) => String(e.path ?? e).endsWith(name))
     if (!hit) throw new Error('no such file')
     return { value: hit[1] }
@@ -150,7 +151,7 @@ test('one click switches even when the sidebar was changed in the app', async ($
 test('the row shows usage, agents, GitHub and the matching Linear team as icons and numbers', async ($, on) => {
   const clock = mock.clock(on)
   fakes(on, 'state')
-  // A session starts: the mod registers its timers and refreshes in the background, past the intro rain
+  // A session starts: the mod registers its timers and refreshes in the background, and let the first refresh finish
   await ($ as any).session.start({ cwd: '/home/me/code/demo', surface: 'desktop' })
   await clock.advance(5_100)
   // Then a reply reports the usage windows
@@ -211,7 +212,7 @@ test('the Git panel shows the branch, the PR and its delivery state', async ($, 
   const clock = mock.clock(on)
   fakes(on, 'state')
   await ($ as any).session.start({ cwd: '/home/me/code/demo', surface: 'desktop' })
-  // Past the intro rain
+  // Let the first refresh finish
   await clock.advance(5_100)
   const ui = await $.ui.mount({ plugin: 'workbench-bar', surface: 'desktop', ...BAND })
   await ui.press({ key: 'pr' })
@@ -222,20 +223,16 @@ test('the Git panel shows the branch, the PR and its delivery state', async ($, 
   await deck.unmount()
 })
 
-test('a new thread opens with a few seconds of falling letters, then the bar', async ($, on) => {
+test('a new thread shows the bar right away, with no intro', async ($, on) => {
   const clock = mock.clock(on)
   fakes(on, 'state')
   await ($ as any).session.start({ cwd: '/home/me/code/demo', surface: 'desktop' })
   await clock.advance(0)
-  const alts = async () => {
-    const ui = await $.ui.mount({ plugin: 'workbench-bar', surface: 'desktop', ...BAND })
-    const found = ((await ui.findAll({ type: 'Svg' })) as any[]).map(x => String(x.props.alt))
-    await ui.unmount()
-    return found
-  }
-  expect(await alts()).toEqual(['intro rain'])
-  await clock.advance(5_100)
-  expect(await alts()).toContain('Clawd idle')
+  const ui = await $.ui.mount({ plugin: 'workbench-bar', surface: 'desktop', ...BAND })
+  const alts = ((await ui.findAll({ type: 'Svg' })) as any[]).map(x => String(x.props.alt))
+  await ui.unmount()
+  expect(alts).toContain('Clawd idle')
+  expect(alts).not.toContain('intro rain')
 })
 
 const PANE = { component: 'Pane', requestId: 'utility-deck', props: { title: 'Details', isFocused: false, bodyColumns: 60, placement: 'dock' } as any } as any
@@ -618,4 +615,40 @@ test('tools that are not installed add no groups', async ($, on) => {
   const deck = await $.ui.mount({ plugin: 'workbench-bar', surface: 'desktop', ...PANE })
   for (const name of ['Other running agents', 'Other finished agents']) expect(await deck.find({ key: 'grp-agents:' + name })).toBeUndefined()
   await deck.unmount()
+})
+
+test('on the Ultra plan the 5-hour window is hidden', async ($, on) => {
+  const clock = mock.clock(on)
+  fakes(on, 'state', { plan: 'Ultra' })
+  await ($ as any).session.start({ cwd: '/home/me/code/demo', surface: 'desktop' })
+  await clock.advance(5_100)
+  await ($ as any).session.measure({
+    context: { tokens: 0, window: 1, percent: 0 },
+    rateLimits: [{ kind: 'five_hour', percentUsed: 40 }, { kind: 'seven_day', percentUsed: 92 }],
+    changed: ['rateLimits'],
+  })
+  const ui = await $.ui.mount({ plugin: 'workbench-bar', surface: 'desktop', ...BAND })
+  const alts = ((await ui.findAll({ type: 'Svg' })) as any[]).map(x => String(x.props.alt))
+  expect(alts).toContain('WK 8% left')
+  expect(alts.some(a => a.includes('5H'))).toBe(false)
+  await ui.unmount()
+  const terminal = await $.ui.mount({ plugin: 'workbench-bar', surface: 'terminal', ...BAND })
+  expect(await terminal.find({ type: 'Text', text: /^5h $/ })).toBeUndefined()
+  expect(((await terminal.findAll({ type: 'Raster' })) as any[]).length).toBe(1)
+  await terminal.unmount()
+})
+
+test('on the Max plan the 5-hour window stays', async ($, on) => {
+  const clock = mock.clock(on)
+  fakes(on, 'state', { plan: 'Max 20x' })
+  await ($ as any).session.start({ cwd: '/home/me/code/demo', surface: 'desktop' })
+  await clock.advance(5_100)
+  await ($ as any).session.measure({
+    context: { tokens: 0, window: 1, percent: 0 },
+    rateLimits: [{ kind: 'five_hour', percentUsed: 40 }, { kind: 'seven_day', percentUsed: 92 }],
+    changed: ['rateLimits'],
+  })
+  const ui = await $.ui.mount({ plugin: 'workbench-bar', surface: 'desktop', ...BAND })
+  expect(((await ui.findAll({ type: 'Svg' })) as any[]).map(x => String(x.props.alt))).toContain('5H 60% left, WK 8% left')
+  await ui.unmount()
 })
