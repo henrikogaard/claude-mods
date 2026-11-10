@@ -1080,36 +1080,6 @@ function clawdSvg(what: Activity): string {
   return `<svg xmlns='http://www.w3.org/2000/svg' width='36' height='18' viewBox='0 0 36 18' shape-rendering='crispEdges'>${scene}</svg>`
 }
 
-// Intro: a few seconds of falling letters when a thread starts, a nod to the old new-thread screen
-const INTRO_MS = 5000
-const RAIN_W = 960
-const RAIN_H = 18
-let introSvg = ''
-let introUntil = 0
-
-// The same letters every time it's drawn, so a redraw doesn't restart the animation
-function rainSvg(seed: number): string {
-  let x = seed || 1
-  const rand = () => ((x = (x * 1103515245 + 12345) % 2147483648) / 2147483648)
-  const letters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
-  const font = "font-family='ui-monospace,SFMono-Regular,Menlo,monospace' font-size='9'"
-  const cols: string[] = []
-  for (let c = 0; c < RAIN_W / 9; c++) {
-    const dur = (0.7 + rand() * 1.4).toFixed(2)
-    const begin = (-rand() * 2).toFixed(2)
-    // Claude orange: a few bright drops, most in the brand colour, some dim
-    const shade = rand() < 0.12 ? '#f5b89e' : rand() < 0.55 ? CLAWD_ORANGE : '#7a3f2c'
-    const chars = [0, 1, 2].map(i => `<tspan x='${c * 9}' dy='${i === 0 ? 0 : 10}'>${letters[Math.floor(rand() * letters.length)]}</tspan>`).join('')
-    cols.push(
-      `<text y='-20' fill='${shade}' ${font}>${chars}<animate attributeName='y' values='-22;${RAIN_H + 6}' dur='${dur}s' begin='${begin}s' repeatCount='indefinite'/></text>`,
-    )
-  }
-  return (
-    `<svg xmlns='http://www.w3.org/2000/svg' width='${RAIN_W}' height='${RAIN_H}' viewBox='0 0 ${RAIN_W} ${RAIN_H}'>` +
-    `<g opacity='0'>${cols.join('')}<animate attributeName='opacity' values='0;1;1;0' keyTimes='0;0.1;0.8;1' dur='${INTRO_MS / 1000}s' fill='freeze'/></g></svg>`
-  )
-}
-
 // Panel art: a hat colour per model, a Clawd wearing it, and a thin progress bar
 function modelColor(model: string): string {
   const m = model.toLowerCase()
@@ -1267,11 +1237,6 @@ export const register: Register = (on, options) => {
         },
       })
     } catch {}
-    // Rain for a few seconds, then the bar
-    const started = await $.clock.now()
-    introSvg = rainSvg(started % 100000)
-    introUntil = started + INTRO_MS
-    $.clock.after(INTRO_MS, () => $.ui.invalidate('ui.render'))
     void refreshAll($)
     $.clock.every(REFRESH_MS, () => void refreshAll($))
     // Move the terminal's scan light
@@ -1462,14 +1427,6 @@ export const register: Register = (on, options) => {
     }
 
     const isDesktop = 'Svg' in els && e.surface === 'desktop'
-    if (isDesktop && introSvg && (await $.clock.now()) < introUntil) {
-      return (
-        <Box flexDirection="column">
-          {theirs}
-          {(els as any).Svg({ key: 'intro', source: introSvg, alt: 'intro rain', isInteractive: true, width: RAIN_W, height: RAIN_H })}
-        </Box>
-      )
-    }
     // This thread's context fill shows as the first meter, beside the plan's usage windows
     const shownLimits: SessionRateLimit[] = contextPct !== undefined ? [{ kind: 'context', percentUsed: contextPct } as SessionRateLimit, ...limits.filter(hasWindow)] : limits.filter(hasWindow)
     const meters =

@@ -151,7 +151,7 @@ test('one click switches even when the sidebar was changed in the app', async ($
 test('the row shows usage, agents, GitHub and the matching Linear team as icons and numbers', async ($, on) => {
   const clock = mock.clock(on)
   fakes(on, 'state')
-  // A session starts: the mod registers its timers and refreshes in the background, past the intro rain
+  // A session starts: the mod registers its timers and refreshes in the background, and let the first refresh finish
   await ($ as any).session.start({ cwd: '/home/me/code/demo', surface: 'desktop' })
   await clock.advance(5_100)
   // Then a reply reports the usage windows
@@ -212,7 +212,7 @@ test('the Git panel shows the branch, the PR and its delivery state', async ($, 
   const clock = mock.clock(on)
   fakes(on, 'state')
   await ($ as any).session.start({ cwd: '/home/me/code/demo', surface: 'desktop' })
-  // Past the intro rain
+  // Let the first refresh finish
   await clock.advance(5_100)
   const ui = await $.ui.mount({ plugin: 'workbench-bar', surface: 'desktop', ...BAND })
   await ui.press({ key: 'pr' })
@@ -223,20 +223,16 @@ test('the Git panel shows the branch, the PR and its delivery state', async ($, 
   await deck.unmount()
 })
 
-test('a new thread opens with a few seconds of falling letters, then the bar', async ($, on) => {
+test('a new thread shows the bar right away, with no intro', async ($, on) => {
   const clock = mock.clock(on)
   fakes(on, 'state')
   await ($ as any).session.start({ cwd: '/home/me/code/demo', surface: 'desktop' })
   await clock.advance(0)
-  const alts = async () => {
-    const ui = await $.ui.mount({ plugin: 'workbench-bar', surface: 'desktop', ...BAND })
-    const found = ((await ui.findAll({ type: 'Svg' })) as any[]).map(x => String(x.props.alt))
-    await ui.unmount()
-    return found
-  }
-  expect(await alts()).toEqual(['intro rain'])
-  await clock.advance(5_100)
-  expect(await alts()).toContain('Clawd idle')
+  const ui = await $.ui.mount({ plugin: 'workbench-bar', surface: 'desktop', ...BAND })
+  const alts = ((await ui.findAll({ type: 'Svg' })) as any[]).map(x => String(x.props.alt))
+  await ui.unmount()
+  expect(alts).toContain('Clawd idle')
+  expect(alts).not.toContain('intro rain')
 })
 
 const PANE = { component: 'Pane', requestId: 'utility-deck', props: { title: 'Details', isFocused: false, bodyColumns: 60, placement: 'dock' } as any } as any
