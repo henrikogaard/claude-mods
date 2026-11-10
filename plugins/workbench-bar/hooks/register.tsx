@@ -504,6 +504,18 @@ export function modelLabel(model: string): string {
   return m ? m[1]!.toLowerCase() + ' ' + m[2] + (m[3] ? '.' + m[3] : '') : shortModel(model)
 }
 
+// The Ultra plan has no 5-hour window. The plan's name comes once from the login record; only
+// that one field is read, and nothing else from the file is kept
+let isUltra = false
+
+async function readPlan($: EngineInterface) {
+  const dir = (await $.env.get('CLAUDE_CONFIG_DIR')) || (await $.env.get('HOME')) || ''
+  const login = JSON.parse((await $.fs.read(dir + '/.claude.json')) as string) as { oauthAccount?: { planDisplayName?: string } }
+  isUltra = /\bultra\b/i.test(login.oauthAccount?.planDisplayName ?? '')
+}
+
+const hasWindow = (l: SessionRateLimit) => !(isUltra && l.kind === 'five_hour')
+
 // A short name for a usage window: 5H, WK, FABLE, or the window's own name
 function windowName(kind: string): string {
   if (kind === 'context') return 'CTX'
@@ -1219,6 +1231,10 @@ export const register: Register = (on, options) => {
   linearServerOption = String((options as { linearServer?: string } | undefined)?.linearServer ?? '')
 
   on('session.start', async ($, e, next) => {
+    // A login that can't be read counts as no Ultra, so the meter shows
+    await readPlan($).catch(() => {
+      isUltra = false
+    })
     try {
       limits = (await $.session.usage()).rateLimits
     } catch {}
@@ -1455,7 +1471,7 @@ export const register: Register = (on, options) => {
       )
     }
     // This thread's context fill shows as the first meter, beside the plan's usage windows
-    const shownLimits: SessionRateLimit[] = contextPct !== undefined ? [{ kind: 'context', percentUsed: contextPct } as SessionRateLimit, ...limits] : [...limits]
+    const shownLimits: SessionRateLimit[] = contextPct !== undefined ? [{ kind: 'context', percentUsed: contextPct } as SessionRateLimit, ...limits.filter(hasWindow)] : limits.filter(hasWindow)
     const meters =
       shownLimits.length === 0
         ? [<Text key="wait" color={DARK}>{'usage: waiting for a reply'}</Text>]
