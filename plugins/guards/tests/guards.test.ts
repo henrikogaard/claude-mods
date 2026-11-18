@@ -31,6 +31,17 @@ test('an attribution commit is denied, a normal commit passes', async ($, on) =>
   expect((ok as any).deny).toBeUndefined()
 })
 
+test('a credit line is denied, the product named as a subject passes', async ($, on) => {
+  engine(on)
+  expect(denied(await $.tool.call({ tool: 'Bash', command: `git commit -m "feat: x" -m "Made with Claude Code"` }), REASON_AI)).toBe(true)
+  expect(denied(await $.tool.call({ tool: 'Bash', command: `gh pr create --title "x" --body "Written by an AI"` }), REASON_AI)).toBe(true)
+  expect(denied(await $.tool.call({ tool: 'Bash', command: `git commit -m "x" -m "Built using ChatGPT"` }), REASON_AI)).toBe(true)
+  const subject = await $.tool.call({ tool: 'Bash', command: `git commit -m "Keep the Claude Code session when a thread moves to another account"` })
+  expect(subject.deny).toBeUndefined()
+  const card = await $.tool.call({ tool: 'Bash', command: `gh pr create --title "Sign in" --body "Every Claude Code subscription card offers Sign in"` })
+  expect(card.deny).toBeUndefined()
+})
+
 test('gh pr create with Generated with Claude Code is denied', async ($, on) => {
   engine(on)
   const bad = await $.tool.call({ tool: 'Bash', command: `gh pr create --title "x" --body "Summary\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)"` })
