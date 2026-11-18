@@ -13,7 +13,10 @@ const ATTRIBUTION: RegExp[] = [
   /noreply@anthropic\.com/i,
   /generated with\s+\[?\s*claude/i,
   /🤖\s*generated/i,
-  /\bclaude code\b/i,
+  // Credit lines only. A product named as what the code works with ("the
+  // Claude Code session") is not credit and passes.
+  /\b(made|built|created|written|authored|generated|produced|drafted|coded|assisted)\s+(with|by|using|in|via)\s+\[?\s*(claude|anthropic|chatgpt|openai|codex|copilot|gemini|cursor|an?\s+ai\b|ai\b|llms?\b|an?\s+llm\b)/i,
+  /\[claude code\]\(https?:\/\/(www\.)?claude\.(com|ai)/i,
 ]
 
 const SECRETS: RegExp[] = [
