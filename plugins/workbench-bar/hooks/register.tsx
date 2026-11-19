@@ -787,6 +787,10 @@ async function findLinear($: EngineInterface): Promise<string | null> {
   return null
 }
 
+// Done, canceled or closed as a duplicate. The type can be spelled either way or missing, so the status name counts too
+const isClosed = (i: { status?: string | { name?: string }; statusType?: string }) =>
+  /^(complet|cancel|duplicate)/i.test(i.statusType ?? '') || /^(done|duplicate|canceled|cancelled)$/i.test(typeof i.status === 'string' ? i.status : (i.status?.name ?? ''))
+
 // Open issues of the Linear team this repo belongs to (e.g. repo acmeapp → team Acme); null hides the icon
 async function refreshLinear($: EngineInterface) {
   if (linearServer === undefined) linearServer = await findLinear($)
@@ -813,7 +817,7 @@ async function refreshLinear($: EngineInterface) {
     mineIds = new Set((mine?.issues ?? []).map(i => i.id))
   } catch {}
   linear = (data?.issues ?? [])
-    .filter(i => i.statusType !== 'completed' && i.statusType !== 'canceled')
+    .filter(i => !isClosed(i))
     .map(i => ({
       id: i.id,
       title: i.title,
