@@ -23,6 +23,9 @@ function fakes(on: any, start: string, opts: { linearTeam?: string; agents?: unk
           issues: [
             { id: 'DEM-1', title: 'Fix it', url: 'https://linear.app/demo/issue/DEM-1', status: 'In Progress', statusType: 'started', priority: 2, assignee: 'Alex', updatedAt: '2026-10-28T10:00:00Z' },
             { id: 'DEM-2', title: 'Done', status: 'Done', statusType: 'completed' },
+            { id: 'DEM-3', title: 'Dup', status: 'Duplicate', statusType: 'canceled' },
+            { id: 'DEM-4', title: 'Dup, no type', status: { name: 'Duplicate' } },
+            { id: 'DEM-5', title: 'Dup, odd type', status: 'Duplicate', statusType: 'cancelled' },
           ],
         })
     }
